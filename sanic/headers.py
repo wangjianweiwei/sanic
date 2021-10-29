@@ -1,12 +1,19 @@
+from __future__ import annotations
+
 import re
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import unquote
 
+from sanic.exceptions import InvalidHeader
 from sanic.helpers import STATUS_CODES
 
 
+# TODO:
+# - the Options object should be a typed object to allow for less casting
+#   across the application (in request.py for example)
 HeaderIterable = Iterable[Tuple[str, Any]]  # Values convertible to str
+HeaderBytesIterable = Iterable[Tuple[bytes, bytes]]
 Options = Dict[str, Union[int, str]]  # key=value fields in various headers
 OptionsIterable = Iterable[Tuple[str, str]]  # May contain duplicate keys
 
@@ -24,6 +31,175 @@ _host_re = re.compile(
 # even though no client espaces in a way that would allow perfect handling.
 
 # For more information, consult ../tests/test_requests.py
+
+
+def parse_arg_as_accept(f):
+    def func(self, other, *args, **kwargs):
+        if not isinstance(other, Accept) and other:
+            other = Accept.parse(other)
+        return f(self, other, *args, **kwargs)
+
+    return func
+
+
+class MediaType(str):
+    def __new__(cls, value: str):
+        return str.__new__(cls, value)
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+        self.is_wildcard = self.check_if_wildcard(value)
+
+    def __eq__(self, other):
+        if self.is_wildcard:
+            return True
+
+        if self.match(other):
+            return True
+
+        other_is_wildcard = (
+            other.is_wildcard
+            if isinstance(other, MediaType)
+            else self.check_if_wildcard(other)
+        )
+
+        return other_is_wildcard
+
+    def match(self, other):
+        other_value = other.value if isinstance(other, MediaType) else other
+        return self.value == other_value
+
+    @staticmethod
+    def check_if_wildcard(value):
+        return value == "*"
+
+
+class Accept(str):
+    def __new__(cls, value: str, *args, **kwargs):
+        return str.__new__(cls, value)
+
+    def __init__(
+        self,
+        value: str,
+        type_: MediaType,
+        subtype: MediaType,
+        *,
+        q: str = "1.0",
+        **kwargs: str,
+    ):
+        qvalue = float(q)
+        if qvalue > 1 or qvalue < 0:
+            raise InvalidHeader(
+                f"Accept header qvalue must be between 0 and 1, not: {qvalue}"
+            )
+        self.value = value
+        self.type_ = type_
+        self.subtype = subtype
+        self.qvalue = qvalue
+        self.params = kwargs
+
+    def _compare(self, other, method):
+        try:
+            return method(self.qvalue, other.qvalue)
+        except (AttributeError, TypeError):
+            return NotImplemented
+
+    @parse_arg_as_accept
+    def __lt__(self, other: Union[str, Accept]):
+        return self._compare(other, lambda s, o: s < o)
+
+    @parse_arg_as_accept
+    def __le__(self, other: Union[str, Accept]):
+        return self._compare(other, lambda s, o: s <= o)
+
+    @parse_arg_as_accept
+    def __eq__(self, other: Union[str, Accept]):  # type: ignore
+        return self._compare(other, lambda s, o: s == o)
+
+    @parse_arg_as_accept
+    def __ge__(self, other: Union[str, Accept]):
+        return self._compare(other, lambda s, o: s >= o)
+
+    @parse_arg_as_accept
+    def __gt__(self, other: Union[str, Accept]):
+        return self._compare(other, lambda s, o: s > o)
+
+    @parse_arg_as_accept
+    def __ne__(self, other: Union[str, Accept]):  # type: ignore
+        return self._compare(other, lambda s, o: s != o)
+
+    @parse_arg_as_accept
+    def match(
+        self,
+        other,
+        *,
+        allow_type_wildcard: bool = True,
+        allow_subtype_wildcard: bool = True,
+    ) -> bool:
+        type_match = (
+            self.type_ == other.type_
+            if allow_type_wildcard
+            else (
+                self.type_.match(other.type_)
+                and not self.type_.is_wildcard
+                and not other.type_.is_wildcard
+            )
+        )
+        subtype_match = (
+            self.subtype == other.subtype
+            if allow_subtype_wildcard
+            else (
+                self.subtype.match(other.subtype)
+                and not self.subtype.is_wildcard
+                and not other.subtype.is_wildcard
+            )
+        )
+
+        return type_match and subtype_match
+
+    @classmethod
+    def parse(cls, raw: str) -> Accept:
+        invalid = False
+        mtype = raw.strip()
+
+        try:
+            media, *raw_params = mtype.split(";")
+            type_, subtype = media.split("/")
+        except ValueError:
+            invalid = True
+
+        if invalid or not type_ or not subtype:
+            raise InvalidHeader(f"Header contains invalid Accept value: {raw}")
+
+        params = dict(
+            [
+                (key.strip(), value.strip())
+                for key, value in (param.split("=", 1) for param in raw_params)
+            ]
+        )
+
+        return cls(mtype, MediaType(type_), MediaType(subtype), **params)
+
+
+class AcceptContainer(list):
+    def __contains__(self, o: object) -> bool:
+        return any(item.match(o) for item in self)
+
+    def match(
+        self,
+        o: object,
+        *,
+        allow_type_wildcard: bool = True,
+        allow_subtype_wildcard: bool = True,
+    ) -> bool:
+        return any(
+            item.match(
+                o,
+                allow_type_wildcard=allow_type_wildcard,
+                allow_subtype_wildcard=allow_subtype_wildcard,
+            )
+            for item in self
+        )
 
 
 def parse_content_header(value: str) -> Tuple[str, Options]:
@@ -98,7 +274,7 @@ def parse_xforwarded(headers, config) -> Optional[Options]:
     """Parse traditional proxy headers."""
     real_ip_header = config.REAL_IP_HEADER
     proxies_count = config.PROXIES_COUNT
-    addr = real_ip_header and headers.get(real_ip_header)
+    addr = real_ip_header and headers.getone(real_ip_header, None)
     if not addr and proxies_count:
         assert proxies_count > 0
         try:
@@ -127,7 +303,7 @@ def parse_xforwarded(headers, config) -> Optional[Options]:
             ("port", "x-forwarded-port"),
             ("path", "x-forwarded-path"),
         ):
-            yield key, headers.get(header)
+            yield key, headers.getone(header, None)
 
     return fwd_normalize(options())
 
@@ -175,26 +351,46 @@ def parse_host(host: str) -> Tuple[Optional[str], Optional[int]]:
     return host.lower(), int(port) if port is not None else None
 
 
-def format_http1(headers: HeaderIterable) -> bytes:
-    """Convert a headers iterable into HTTP/1 header format.
+_HTTP1_STATUSLINES = [
+    b"HTTP/1.1 %d %b\r\n" % (status, STATUS_CODES.get(status, b"UNKNOWN"))
+    for status in range(1000)
+]
 
-    - Outputs UTF-8 bytes where each header line ends with \\r\\n.
-    - Values are converted into strings if necessary.
+
+def format_http1_response(status: int, headers: HeaderBytesIterable) -> bytes:
+    """Format a HTTP/1.1 response header."""
+    # Note: benchmarks show that here bytes concat is faster than bytearray,
+    # b"".join() or %-formatting. %timeit any changes you make.
+    ret = _HTTP1_STATUSLINES[status]
+    for h in headers:
+        ret += b"%b: %b\r\n" % h
+    ret += b"\r\n"
+    return ret
+
+
+def _sort_accept_value(accept: Accept):
+    return (
+        accept.qvalue,
+        len(accept.params),
+        accept.subtype != "*",
+        accept.type_ != "*",
+    )
+
+
+def parse_accept(accept: str) -> AcceptContainer:
+    """Parse an Accept header and order the acceptable media types in
+    accorsing to RFC 7231, s. 5.3.2
+    https://datatracker.ietf.org/doc/html/rfc7231#section-5.3.2
     """
-    return "".join(f"{name}: {val}\r\n" for name, val in headers).encode()
+    media_types = accept.split(",")
+    accept_list: List[Accept] = []
 
+    for mtype in media_types:
+        if not mtype:
+            continue
 
-def format_http1_response(
-    status: int, headers: HeaderIterable, body=b""
-) -> bytes:
-    """Format a full HTTP/1.1 response.
+        accept_list.append(Accept.parse(mtype))
 
-    - If `body` is included, content-length must be specified in headers.
-    """
-    headerbytes = format_http1(headers)
-    return b"HTTP/1.1 %d %b\r\n%b\r\n%b" % (
-        status,
-        STATUS_CODES.get(status, b"UNKNOWN"),
-        headerbytes,
-        body,
+    return AcceptContainer(
+        sorted(accept_list, key=_sort_accept_value, reverse=True)
     )

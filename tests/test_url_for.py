@@ -1,16 +1,18 @@
 import asyncio
 
+import pytest
+
+from sanic_testing.testing import SanicTestClient
+
 from sanic.blueprints import Blueprint
 
 
 def test_routes_with_host(app):
-    @app.route("/")
     @app.route("/", name="hostindex", host="example.com")
     @app.route("/path", name="hostpath", host="path.example.com")
     def index(request):
         pass
 
-    assert app.url_for("index") == "/"
     assert app.url_for("hostindex") == "/"
     assert app.url_for("hostpath") == "/path"
     assert app.url_for("hostindex", _external=True) == "http://example.com/"
@@ -20,7 +22,36 @@ def test_routes_with_host(app):
     )
 
 
-def test_websocket_bp_route_name(app):
+def test_routes_with_multiple_hosts(app):
+    @app.route("/", name="hostindex", host=["example.com", "path.example.com"])
+    def index(request):
+        pass
+
+    assert app.url_for("hostindex") == "/"
+    assert (
+        app.url_for("hostindex", _host="example.com") == "http://example.com/"
+    )
+
+    with pytest.raises(ValueError) as e:
+        assert app.url_for("hostindex", _external=True)
+    assert str(e.value).startswith("Host is ambiguous")
+
+    with pytest.raises(ValueError) as e:
+        assert app.url_for("hostindex", _host="unknown.com")
+    assert str(e.value).startswith(
+        "Requested host (unknown.com) is not available for this route"
+    )
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    (
+        ("test_route", "/bp/route"),
+        ("test_route2", "/bp/route2"),
+        ("foobar_3", "/bp/route3"),
+    ),
+)
+def test_websocket_bp_route_name(app, name, expected):
     """Tests that blueprint websocket route is named."""
     event = asyncio.Event()
     bp = Blueprint("test_bp", url_prefix="/bp")
@@ -46,18 +77,28 @@ def test_websocket_bp_route_name(app):
     uri = app.url_for("test_bp.main")
     assert uri == "/bp/main"
 
-    uri = app.url_for("test_bp.test_route")
-    assert uri == "/bp/route"
-    request, response = app.test_client.websocket(uri)
+    uri = app.url_for(f"test_bp.{name}")
+    assert uri == expected
+    request, response = SanicTestClient(app).websocket(uri)
     assert response.opened is True
     assert event.is_set()
 
-    event.clear()
-    uri = app.url_for("test_bp.test_route2")
-    assert uri == "/bp/route2"
-    request, response = app.test_client.websocket(uri)
-    assert response.opened is True
-    assert event.is_set()
 
-    uri = app.url_for("test_bp.foobar_3")
-    assert uri == "/bp/route3"
+# TODO: add test with a route with multiple hosts
+# TODO: add test with a route with _host in url_for
+@pytest.mark.parametrize(
+    "path,strict,expected",
+    (
+        ("/foo", False, "/foo"),
+        ("/foo/", False, "/foo"),
+        ("/foo", True, "/foo"),
+        ("/foo/", True, "/foo/"),
+    ),
+)
+def test_trailing_slash_url_for(app, path, strict, expected):
+    @app.route(path, strict_slashes=strict)
+    def handler(*_):
+        ...
+
+    url = app.url_for("handler")
+    assert url == expected

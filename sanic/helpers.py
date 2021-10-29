@@ -2,9 +2,10 @@
 
 from importlib import import_module
 from inspect import ismodule
+from typing import Dict
 
 
-STATUS_CODES = {
+STATUS_CODES: Dict[int, bytes] = {
     100: b"Continue",
     101: b"Switching Protocols",
     102: b"Processing",
@@ -154,3 +155,17 @@ def import_string(module_name, package=None):
     if ismodule(obj):
         return obj
     return obj()
+
+
+class Default:
+    """
+    It is used to replace `None` or `object()` as a sentinel
+    that represents a default value. Sometimes we want to set
+    a value to `None` so we cannot use `None` to represent the
+    default value, and `object()` is hard to be typed.
+    """
+
+    pass
+
+
+_default = Default()

@@ -1,16 +1,27 @@
+import asyncio
+import logging
 import random
 import re
 import string
 import sys
 import uuid
 
+from typing import Tuple
+
 import pytest
 
+from sanic_routing.exceptions import RouteExists
+from sanic_testing.testing import PORT
+
 from sanic import Sanic
-from sanic.router import RouteExists, Router
+from sanic.constants import HTTP_METHODS
+from sanic.router import Router
+from sanic.touchup.service import TouchUp
 
 
+slugify = re.compile(r"[^a-zA-Z0-9_\-]")
 random.seed("Pack my box with five dozen liquor jugs.")
+Sanic.test_mode = True
 
 if sys.platform in ["win32", "cygwin"]:
     collect_ignore = ["test_worker.py"]
@@ -29,33 +40,32 @@ async def _handler(request):
 
 
 TYPE_TO_GENERATOR_MAP = {
-    "string": lambda: "".join(
-        [random.choice(string.ascii_letters + string.digits) for _ in range(4)]
+    "str": lambda: "".join(
+        [random.choice(string.ascii_lowercase) for _ in range(4)]
     ),
     "int": lambda: random.choice(range(1000000)),
-    "number": lambda: random.random(),
+    "float": lambda: random.random(),
     "alpha": lambda: "".join(
-        [random.choice(string.ascii_letters) for _ in range(4)]
+        [random.choice(string.ascii_lowercase) for _ in range(4)]
     ),
     "uuid": lambda: str(uuid.uuid1()),
 }
+
+CACHE = {}
 
 
 class RouteStringGenerator:
 
     ROUTE_COUNT_PER_DEPTH = 100
-    HTTP_METHODS = ["GET", "PUT", "POST", "PATCH", "DELETE", "OPTION"]
-    ROUTE_PARAM_TYPES = ["string", "int", "number", "alpha", "uuid"]
+    HTTP_METHODS = HTTP_METHODS
+    ROUTE_PARAM_TYPES = ["str", "int", "float", "alpha", "uuid"]
 
     def generate_random_direct_route(self, max_route_depth=4):
         routes = []
         for depth in range(1, max_route_depth + 1):
             for _ in range(self.ROUTE_COUNT_PER_DEPTH):
                 route = "/".join(
-                    [
-                        TYPE_TO_GENERATOR_MAP.get("string")()
-                        for _ in range(depth)
-                    ]
+                    [TYPE_TO_GENERATOR_MAP.get("str")() for _ in range(depth)]
                 )
                 route = route.replace(".", "", -1)
                 route_detail = (random.choice(self.HTTP_METHODS), route)
@@ -71,7 +81,7 @@ class RouteStringGenerator:
             new_route_part = "/".join(
                 [
                     "<{}:{}>".format(
-                        TYPE_TO_GENERATOR_MAP.get("string")(),
+                        TYPE_TO_GENERATOR_MAP.get("str")(),
                         random.choice(self.ROUTE_PARAM_TYPES),
                     )
                     for _ in range(max_route_depth - current_length)
@@ -86,7 +96,7 @@ class RouteStringGenerator:
     def generate_url_for_template(template):
         url = template
         for pattern, param_type in re.findall(
-            re.compile(r"((?:<\w+:(string|int|number|alpha|uuid)>)+)"),
+            re.compile(r"((?:<\w+:(str|int|float|alpha|uuid)>)+)"),
             template,
         ):
             value = TYPE_TO_GENERATOR_MAP.get(param_type)()
@@ -95,14 +105,15 @@ class RouteStringGenerator:
 
 
 @pytest.fixture(scope="function")
-def sanic_router():
+def sanic_router(app):
     # noinspection PyProtectedMember
-    def _setup(route_details: tuple) -> (Router, tuple):
+    def _setup(route_details: tuple) -> Tuple[Router, tuple]:
         router = Router()
+        router.ctx.app = app
         added_router = []
         for method, route in route_details:
             try:
-                router._add(
+                router.add(
                     uri=f"/{route}",
                     methods=frozenset({method}),
                     host="localhost",
@@ -111,6 +122,7 @@ def sanic_router():
                 added_router.append((method, route))
             except RouteExists:
                 pass
+        router.finalize()
         return router, added_router
 
     return _setup
@@ -126,6 +138,35 @@ def url_param_generator():
     return TYPE_TO_GENERATOR_MAP
 
 
-@pytest.fixture
+@pytest.fixture(scope="function")
 def app(request):
-    return Sanic(request.node.name)
+    if not CACHE:
+        for target, method_name in TouchUp._registry:
+            CACHE[method_name] = getattr(target, method_name)
+    app = Sanic(slugify.sub("-", request.node.name))
+    yield app
+    for target, method_name in TouchUp._registry:
+        setattr(target, method_name, CACHE[method_name])
+
+
+@pytest.fixture(scope="function")
+def run_startup(caplog):
+    def run(app):
+        nonlocal caplog
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        with caplog.at_level(logging.DEBUG):
+            server = app.create_server(
+                debug=True, return_asyncio_server=True, port=PORT
+            )
+            loop._stopping = False
+
+            _server = loop.run_until_complete(server)
+
+            _server.close()
+            loop.run_until_complete(_server.wait_closed())
+            app.stop()
+
+        return caplog.record_tuples
+
+    return run

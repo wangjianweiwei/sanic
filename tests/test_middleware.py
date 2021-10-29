@@ -1,10 +1,11 @@
 import logging
 
 from asyncio import CancelledError
+from itertools import count
 
-from sanic.exceptions import NotFound, SanicException
+from sanic.exceptions import NotFound
 from sanic.request import Request
-from sanic.response import HTTPResponse, text
+from sanic.response import HTTPResponse, json, text
 
 
 # ------------------------------------------------------------ #
@@ -27,6 +28,28 @@ def test_middleware_request(app):
 
     assert response.text == "OK"
     assert type(results[0]) is Request
+
+
+def test_middleware_request_as_convenience(app):
+    results = []
+
+    @app.on_request
+    async def handler1(request):
+        results.append(request)
+
+    @app.on_request()
+    async def handler2(request):
+        results.append(request)
+
+    @app.route("/")
+    async def handler3(request):
+        return text("OK")
+
+    request, response = app.test_client.get("/")
+
+    assert response.text == "OK"
+    assert type(results[0]) is Request
+    assert type(results[1]) is Request
 
 
 def test_middleware_response(app):
@@ -53,8 +76,63 @@ def test_middleware_response(app):
     assert isinstance(results[2], HTTPResponse)
 
 
+def test_middleware_response_as_convenience(app):
+    results = []
+
+    @app.on_request
+    async def process_request(request):
+        results.append(request)
+
+    @app.on_response
+    async def process_response_1(request, response):
+        results.append(request)
+        results.append(response)
+
+    @app.on_response()
+    async def process_response_2(request, response):
+        results.append(request)
+        results.append(response)
+
+    @app.route("/")
+    async def handler(request):
+        return text("OK")
+
+    request, response = app.test_client.get("/")
+
+    assert response.text == "OK"
+    assert type(results[0]) is Request
+    assert type(results[1]) is Request
+    assert isinstance(results[2], HTTPResponse)
+    assert type(results[3]) is Request
+    assert isinstance(results[4], HTTPResponse)
+
+
+def test_middleware_response_as_convenience_called(app):
+    results = []
+
+    @app.on_request()
+    async def process_request(request):
+        results.append(request)
+
+    @app.on_response()
+    async def process_response(request, response):
+        results.append(request)
+        results.append(response)
+
+    @app.route("/")
+    async def handler(request):
+        return text("OK")
+
+    request, response = app.test_client.get("/")
+
+    assert response.text == "OK"
+    assert type(results[0]) is Request
+    assert type(results[1]) is Request
+    assert isinstance(results[2], HTTPResponse)
+
+
 def test_middleware_response_exception(app):
-    result = {"status_code": None}
+    result = {"status_code": "middleware not run"}
 
     @app.middleware("response")
     async def process_response(request, response):
@@ -90,7 +168,7 @@ def test_middleware_response_raise_cancelled_error(app, caplog):
 
         assert response.status == 503
         assert (
-            "sanic.root",
+            "sanic.error",
             logging.ERROR,
             "Exception occurred while handling uri: 'http://127.0.0.1:42101/'",
         ) not in caplog.record_tuples
@@ -101,13 +179,14 @@ def test_middleware_response_raise_exception(app, caplog):
     async def process_response(request, response):
         raise Exception("Exception at response middleware")
 
+    app.route("/")(lambda x: x)
     with caplog.at_level(logging.ERROR):
         reqrequest, response = app.test_client.get("/fail")
 
     assert response.status == 404
     # 404 errors are not logged
     assert (
-        "sanic.root",
+        "sanic.error",
         logging.ERROR,
         "Exception occurred while handling uri: 'http://127.0.0.1:42101/'",
     ) not in caplog.record_tuples
@@ -128,7 +207,7 @@ def test_middleware_override_request(app):
     async def handler(request):
         return text("FAIL")
 
-    response = app.test_client.get("/", gather_request=False)
+    _, response = app.test_client.get("/", gather_request=False)
 
     assert response.status == 200
     assert response.text == "OK"
@@ -184,3 +263,37 @@ def test_middleware_order(app):
 
     assert response.status == 200
     assert order == [1, 2, 3, 4, 5, 6]
+
+
+def test_request_middleware_executes_once(app):
+    i = count()
+
+    @app.middleware("request")
+    async def inc(request):
+        nonlocal i
+        next(i)
+
+    @app.route("/")
+    async def handler(request):
+        await request.app._run_request_middleware(request)
+        return text("OK")
+
+    request, response = app.test_client.get("/")
+    assert next(i) == 1
+
+    request, response = app.test_client.get("/")
+    assert next(i) == 3
+
+
+def test_middleware_added_response(app):
+    @app.on_response
+    def display(_, response):
+        response["foo"] = "bar"
+        return json(response)
+
+    @app.get("/")
+    async def handler(request):
+        return {}
+
+    _, response = app.test_client.get("/")
+    assert response.json["foo"] == "bar"

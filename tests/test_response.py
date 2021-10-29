@@ -1,21 +1,19 @@
 import asyncio
 import inspect
 import os
-import warnings
 
 from collections import namedtuple
 from mimetypes import guess_type
 from random import choice
-from unittest.mock import MagicMock
 from urllib.parse import unquote
 
 import pytest
 
 from aiofiles import os as async_os
 
+from sanic import Sanic
 from sanic.response import (
     HTTPResponse,
-    StreamingHTTPResponse,
     empty,
     file,
     file_stream,
@@ -24,8 +22,6 @@ from sanic.response import (
     stream,
     text,
 )
-from sanic.server import HttpProtocol
-from sanic.testing import HOST, PORT
 
 
 JSON_DATA = {"ok": True}
@@ -41,7 +37,8 @@ def test_response_body_not_a_string(app):
         return text(random_num)
 
     request, response = app.test_client.get("/hello")
-    assert response.text == str(random_num)
+    assert response.status == 500
+    assert b"Internal Server Error" in response.body
 
 
 async def sample_streaming_fn(response):
@@ -50,16 +47,24 @@ async def sample_streaming_fn(response):
     await response.write("bar")
 
 
-def test_method_not_allowed(app):
+def test_method_not_allowed():
+    app = Sanic("app")
+
     @app.get("/")
     async def test_get(request):
         return response.json({"hello": "world"})
 
     request, response = app.test_client.head("/")
-    assert response.headers["Allow"] == "GET"
+    assert set(response.headers["Allow"].split(", ")) == {
+        "GET",
+    }
 
     request, response = app.test_client.post("/")
-    assert response.headers["Allow"] == "GET"
+    assert set(response.headers["Allow"].split(", ")) == {
+        "GET",
+    }
+
+    app.router.reset()
 
     @app.post("/")
     async def test_post(request):
@@ -67,12 +72,18 @@ def test_method_not_allowed(app):
 
     request, response = app.test_client.head("/")
     assert response.status == 405
-    assert set(response.headers["Allow"].split(", ")) == {"GET", "POST"}
+    assert set(response.headers["Allow"].split(", ")) == {
+        "GET",
+        "POST",
+    }
     assert response.headers["Content-Length"] == "0"
 
     request, response = app.test_client.patch("/")
     assert response.status == 405
-    assert set(response.headers["Allow"].split(", ")) == {"GET", "POST"}
+    assert set(response.headers["Allow"].split(", ")) == {
+        "GET",
+        "POST",
+    }
     assert response.headers["Content-Length"] == "0"
 
 
@@ -84,7 +95,6 @@ def test_response_header(app):
     request, response = app.test_client.get("/")
     assert dict(response.headers) == {
         "connection": "keep-alive",
-        "keep-alive": str(app.config.KEEP_ALIVE_TIMEOUT),
         "content-length": "11",
         "content-type": "application/json",
     }
@@ -200,7 +210,6 @@ def streaming_app(app):
     async def test(request):
         return stream(
             sample_streaming_fn,
-            headers={"Content-Length": "7"},
             content_type="text/csv",
         )
 
@@ -215,7 +224,6 @@ def non_chunked_streaming_app(app):
             sample_streaming_fn,
             headers={"Content-Length": "7"},
             content_type="text/csv",
-            chunked=False,
         )
 
     return app
@@ -235,8 +243,25 @@ def test_chunked_streaming_returns_correct_content(streaming_app):
     assert response.text == "foo,bar"
 
 
+@pytest.mark.asyncio
+async def test_chunked_streaming_returns_correct_content_asgi(streaming_app):
+    request, response = await streaming_app.asgi_client.get("/")
+    assert response.body == b"foo,bar"
+
+
 def test_non_chunked_streaming_adds_correct_headers(non_chunked_streaming_app):
     request, response = non_chunked_streaming_app.test_client.get("/")
+
+    assert "Transfer-Encoding" not in response.headers
+    assert response.headers["Content-Type"] == "text/csv"
+    assert response.headers["Content-Length"] == "7"
+
+
+@pytest.mark.asyncio
+async def test_non_chunked_streaming_adds_correct_headers_asgi(
+    non_chunked_streaming_app,
+):
+    request, response = await non_chunked_streaming_app.asgi_client.get("/")
     assert "Transfer-Encoding" not in response.headers
     assert response.headers["Content-Type"] == "text/csv"
     assert response.headers["Content-Length"] == "7"
@@ -247,115 +272,6 @@ def test_non_chunked_streaming_returns_correct_content(
 ):
     request, response = non_chunked_streaming_app.test_client.get("/")
     assert response.text == "foo,bar"
-
-
-@pytest.mark.parametrize("status", [200, 201, 400, 401])
-def test_stream_response_status_returns_correct_headers(status):
-    response = StreamingHTTPResponse(sample_streaming_fn, status=status)
-    headers = response.get_headers()
-    assert b"HTTP/1.1 %s" % str(status).encode() in headers
-
-
-@pytest.mark.parametrize("keep_alive_timeout", [10, 20, 30])
-def test_stream_response_keep_alive_returns_correct_headers(
-    keep_alive_timeout,
-):
-    response = StreamingHTTPResponse(sample_streaming_fn)
-    headers = response.get_headers(
-        keep_alive=True, keep_alive_timeout=keep_alive_timeout
-    )
-
-    assert b"Keep-Alive: %s\r\n" % str(keep_alive_timeout).encode() in headers
-
-
-def test_stream_response_includes_chunked_header_http11():
-    response = StreamingHTTPResponse(sample_streaming_fn)
-    headers = response.get_headers(version="1.1")
-    assert b"Transfer-Encoding: chunked\r\n" in headers
-
-
-def test_stream_response_does_not_include_chunked_header_http10():
-    response = StreamingHTTPResponse(sample_streaming_fn)
-    headers = response.get_headers(version="1.0")
-    assert b"Transfer-Encoding: chunked\r\n" not in headers
-
-
-def test_stream_response_does_not_include_chunked_header_if_disabled():
-    response = StreamingHTTPResponse(sample_streaming_fn, chunked=False)
-    headers = response.get_headers(version="1.1")
-    assert b"Transfer-Encoding: chunked\r\n" not in headers
-
-
-def test_stream_response_writes_correct_content_to_transport_when_chunked(
-    streaming_app,
-):
-    response = StreamingHTTPResponse(sample_streaming_fn)
-    response.protocol = MagicMock(HttpProtocol)
-    response.protocol.transport = MagicMock(asyncio.Transport)
-
-    async def mock_drain():
-        pass
-
-    async def mock_push_data(data):
-        response.protocol.transport.write(data)
-
-    response.protocol.push_data = mock_push_data
-    response.protocol.drain = mock_drain
-
-    @streaming_app.listener("after_server_start")
-    async def run_stream(app, loop):
-        await response.stream()
-        assert response.protocol.transport.write.call_args_list[1][0][0] == (
-            b"4\r\nfoo,\r\n"
-        )
-
-        assert response.protocol.transport.write.call_args_list[2][0][0] == (
-            b"3\r\nbar\r\n"
-        )
-
-        assert response.protocol.transport.write.call_args_list[3][0][0] == (
-            b"0\r\n\r\n"
-        )
-
-        assert len(response.protocol.transport.write.call_args_list) == 4
-
-        app.stop()
-
-    streaming_app.run(host=HOST, port=PORT)
-
-
-def test_stream_response_writes_correct_content_to_transport_when_not_chunked(
-    streaming_app,
-):
-    response = StreamingHTTPResponse(sample_streaming_fn)
-    response.protocol = MagicMock(HttpProtocol)
-    response.protocol.transport = MagicMock(asyncio.Transport)
-
-    async def mock_drain():
-        pass
-
-    async def mock_push_data(data):
-        response.protocol.transport.write(data)
-
-    response.protocol.push_data = mock_push_data
-    response.protocol.drain = mock_drain
-
-    @streaming_app.listener("after_server_start")
-    async def run_stream(app, loop):
-        await response.stream(version="1.0")
-        assert response.protocol.transport.write.call_args_list[1][0][0] == (
-            b"foo,"
-        )
-
-        assert response.protocol.transport.write.call_args_list[2][0][0] == (
-            b"bar"
-        )
-
-        assert len(response.protocol.transport.write.call_args_list) == 3
-
-        app.stop()
-
-    streaming_app.run(host=HOST, port=PORT)
 
 
 def test_stream_response_with_cookies(app):
@@ -448,7 +364,7 @@ def test_file_head_response(app, file_name, static_file_directory):
         file_path = os.path.join(static_file_directory, filename)
         file_path = os.path.abspath(unquote(file_path))
         stats = await async_os.stat(file_path)
-        headers = dict()
+        headers = {}
         headers["Accept-Ranges"] = "bytes"
         headers["Content-Length"] = str(stats.st_size)
         if request.method == "HEAD":
@@ -524,7 +440,7 @@ def test_file_stream_head_response(app, file_name, static_file_directory):
     async def file_route(request, filename):
         file_path = os.path.join(static_file_directory, filename)
         file_path = os.path.abspath(unquote(file_path))
-        headers = dict()
+        headers = {}
         headers["Accept-Ranges"] = "bytes"
         if request.method == "HEAD":
             # Return a normal HTTPResponse, not a
@@ -610,15 +526,17 @@ def test_empty_response(app):
     assert response.body == b""
 
 
-def test_response_body_bytes_deprecated(app):
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
+def test_direct_response_stream(app):
+    @app.route("/")
+    async def test(request):
+        response = await request.respond(content_type="text/csv")
+        await response.send("foo,")
+        await response.send("bar")
+        await response.eof()
+        return response
 
-        HTTPResponse(body_bytes=b"bytes")
-
-        assert len(w) == 1
-        assert issubclass(w[0].category, DeprecationWarning)
-        assert (
-            "Parameter `body_bytes` is deprecated, use `body` instead"
-            in str(w[0].message)
-        )
+    _, response = app.test_client.get("/")
+    assert response.text == "foo,bar"
+    assert response.headers["Transfer-Encoding"] == "chunked"
+    assert response.headers["Content-Type"] == "text/csv"
+    assert "Content-Length" not in response.headers

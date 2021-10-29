@@ -7,9 +7,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from sanic_testing.testing import HOST, PORT
+
 from sanic.compat import ctrlc_workaround_for_windows
 from sanic.response import HTTPResponse
-from sanic.testing import HOST, PORT
 
 
 async def stop(app, loop):
@@ -94,7 +95,7 @@ def test_windows_workaround():
         os.kill(os.getpid(), signal.SIGINT)
         await asyncio.sleep(0.2)
         assert app.is_stopping
-        assert app.stay_active_task.result() == None
+        assert app.stay_active_task.result() is None
         # Second Ctrl+C should raise
         with pytest.raises(KeyboardInterrupt):
             os.kill(os.getpid(), signal.SIGINT)

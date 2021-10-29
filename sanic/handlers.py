@@ -1,12 +1,14 @@
-from traceback import format_exc
+from inspect import signature
+from typing import Dict, List, Optional, Tuple, Type
 
-from sanic.errorpages import exception_response
+from sanic.errorpages import BaseRenderer, HTMLRenderer, exception_response
 from sanic.exceptions import (
     ContentRangeError,
     HeaderNotFound,
     InvalidRangeType,
 )
-from sanic.log import logger
+from sanic.log import error_logger
+from sanic.models.handler_types import RouteHandler
 from sanic.response import text
 
 
@@ -23,16 +25,47 @@ class ErrorHandler:
 
     """
 
-    handlers = None
-    cached_handlers = None
-    _missing = object()
-
-    def __init__(self):
-        self.handlers = []
-        self.cached_handlers = {}
+    # Beginning in v22.3, the base renderer will be TextRenderer
+    def __init__(
+        self, fallback: str = "auto", base: Type[BaseRenderer] = HTMLRenderer
+    ):
+        self.handlers: List[Tuple[Type[BaseException], RouteHandler]] = []
+        self.cached_handlers: Dict[
+            Tuple[Type[BaseException], Optional[str]], Optional[RouteHandler]
+        ] = {}
         self.debug = False
+        self.fallback = fallback
+        self.base = base
 
-    def add(self, exception, handler):
+    @classmethod
+    def finalize(cls, error_handler):
+        if not isinstance(error_handler, cls):
+            error_logger.warning(
+                f"Error handler is non-conforming: {type(error_handler)}"
+            )
+
+        sig = signature(error_handler.lookup)
+        if len(sig.parameters) == 1:
+            error_logger.warning(
+                DeprecationWarning(
+                    "You are using a deprecated error handler. The lookup "
+                    "method should accept two positional parameters: "
+                    "(exception, route_name: Optional[str]). "
+                    "Until you upgrade your ErrorHandler.lookup, Blueprint "
+                    "specific exceptions will not work properly. Beginning "
+                    "in v22.3, the legacy style lookup method will not "
+                    "work at all."
+                ),
+            )
+            error_handler._lookup = error_handler._legacy_lookup
+
+    def _full_lookup(self, exception, route_name: Optional[str] = None):
+        return self.lookup(exception, route_name)
+
+    def _legacy_lookup(self, exception, route_name: Optional[str] = None):
+        return self.lookup(exception)
+
+    def add(self, exception, handler, route_names: Optional[List[str]] = None):
         """
         Add a new exception handler to an already existing handler object.
 
@@ -45,9 +78,16 @@ class ErrorHandler:
 
         :return: None
         """
+        # self.handlers is deprecated and will be removed in version 22.3
         self.handlers.append((exception, handler))
 
-    def lookup(self, exception):
+        if route_names:
+            for route in route_names:
+                self.cached_handlers[(exception, route)] = handler
+        else:
+            self.cached_handlers[(exception, None)] = handler
+
+    def lookup(self, exception, route_name: Optional[str] = None):
         """
         Lookup the existing instance of :class:`ErrorHandler` and fetch the
         registered handler for a specific type of exception.
@@ -61,15 +101,31 @@ class ErrorHandler:
 
         :return: Registered function if found ``None`` otherwise
         """
-        handler = self.cached_handlers.get(type(exception), self._missing)
-        if handler is self._missing:
-            for exception_class, handler in self.handlers:
-                if isinstance(exception, exception_class):
-                    self.cached_handlers[type(exception)] = handler
+        exception_class = type(exception)
+
+        for name in (route_name, None):
+            exception_key = (exception_class, name)
+            handler = self.cached_handlers.get(exception_key)
+            if handler:
+                return handler
+
+        for name in (route_name, None):
+            for ancestor in type.mro(exception_class):
+                exception_key = (ancestor, name)
+                if exception_key in self.cached_handlers:
+                    handler = self.cached_handlers[exception_key]
+                    self.cached_handlers[
+                        (exception_class, route_name)
+                    ] = handler
                     return handler
-            self.cached_handlers[type(exception)] = None
-            handler = None
+
+                if ancestor is BaseException:
+                    break
+        self.cached_handlers[(exception_class, route_name)] = None
+        handler = None
         return handler
+
+    _lookup = _full_lookup
 
     def response(self, request, exception):
         """Fetches and executes an exception handler and returns a response
@@ -85,7 +141,8 @@ class ErrorHandler:
         :return: Wrap the return value obtained from :func:`default`
             or registered handler for that type of exception.
         """
-        handler = self.lookup(exception)
+        route_name = request.name if request else None
+        handler = self._lookup(exception, route_name)
         response = None
         try:
             if handler:
@@ -93,7 +150,6 @@ class ErrorHandler:
             if response is None:
                 response = self.default(request, exception)
         except Exception:
-            self.log(format_exc())
             try:
                 url = repr(request.url)
             except AttributeError:
@@ -101,18 +157,13 @@ class ErrorHandler:
             response_message = (
                 "Exception raised in exception handler " '"%s" for uri: %s'
             )
-            logger.exception(response_message, handler.__name__, url)
+            error_logger.exception(response_message, handler.__name__, url)
 
             if self.debug:
                 return text(response_message % (handler.__name__, url), 500)
             else:
                 return text("An error occurred while handling an error", 500)
         return response
-
-    def log(self, message, level="error"):
-        """
-        Deprecated, do not use.
-        """
 
     def default(self, request, exception):
         """
@@ -129,17 +180,28 @@ class ErrorHandler:
             :class:`Exception`
         :return:
         """
+        self.log(request, exception)
+        return exception_response(
+            request,
+            exception,
+            debug=self.debug,
+            base=self.base,
+            fallback=self.fallback,
+        )
+
+    @staticmethod
+    def log(request, exception):
         quiet = getattr(exception, "quiet", False)
-        if quiet is False:
+        noisy = getattr(request.app.config, "NOISY_EXCEPTIONS", False)
+        if quiet is False or noisy is True:
             try:
                 url = repr(request.url)
             except AttributeError:
                 url = "unknown"
 
-            self.log(format_exc())
-            logger.exception("Exception occurred while handling uri: %s", url)
-
-        return exception_response(request, exception, self.debug)
+            error_logger.exception(
+                "Exception occurred while handling uri: %s", url
+            )
 
 
 class ContentRangeHandler:
@@ -165,7 +227,7 @@ class ContentRangeHandler:
 
     def __init__(self, request, stats):
         self.total = stats.st_size
-        _range = request.headers.get("Range")
+        _range = request.headers.getone("range", None)
         if _range is None:
             raise HeaderNotFound("Range Header Not Found")
         unit, _, value = tuple(map(str.strip, _range.partition("=")))

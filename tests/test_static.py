@@ -1,9 +1,15 @@
 import inspect
+import logging
 import os
 
+from collections import Counter
+from pathlib import Path
 from time import gmtime, strftime
 
 import pytest
+
+from sanic import text
+from sanic.exceptions import FileNotFound
 
 
 @pytest.fixture(scope="module")
@@ -76,6 +82,42 @@ def test_static_file(app, static_file_directory, file_name):
     assert response.body == get_file_content(static_file_directory, file_name)
 
 
+@pytest.mark.parametrize(
+    "file_name",
+    ["test.file", "decode me.txt", "python.png", "symlink", "hard_link"],
+)
+def test_static_file_pathlib(app, static_file_directory, file_name):
+    file_path = Path(get_file_path(static_file_directory, file_name))
+    app.static("/testing.file", file_path)
+    request, response = app.test_client.get("/testing.file")
+    assert response.status == 200
+    assert response.body == get_file_content(static_file_directory, file_name)
+
+
+@pytest.mark.parametrize(
+    "file_name",
+    [b"test.file", b"decode me.txt", b"python.png"],
+)
+def test_static_file_bytes(app, static_file_directory, file_name):
+    bsep = os.path.sep.encode("utf-8")
+    file_path = static_file_directory.encode("utf-8") + bsep + file_name
+    app.static("/testing.file", file_path)
+    request, response = app.test_client.get("/testing.file")
+    assert response.status == 200
+
+
+@pytest.mark.parametrize(
+    "file_name",
+    [{}, [], object()],
+)
+def test_static_file_invalid_path(app, static_file_directory, file_name):
+    app.route("/")(lambda x: x)
+    with pytest.raises(ValueError):
+        app.static("/testing.file", file_name)
+    request, response = app.test_client.get("/testing.file")
+    assert response.status == 404
+
+
 @pytest.mark.parametrize("file_name", ["test.html"])
 def test_static_file_content_type(app, static_file_directory, file_name):
     app.static(
@@ -88,6 +130,40 @@ def test_static_file_content_type(app, static_file_directory, file_name):
     assert response.status == 200
     assert response.body == get_file_content(static_file_directory, file_name)
     assert response.headers["Content-Type"] == "text/html; charset=utf-8"
+
+
+@pytest.mark.parametrize(
+    "file_name,expected",
+    [
+        ("test.html", "text/html; charset=utf-8"),
+        ("decode me.txt", "text/plain; charset=utf-8"),
+        ("test.file", "application/octet-stream"),
+    ],
+)
+def test_static_file_content_type_guessed(
+    app, static_file_directory, file_name, expected
+):
+    app.static(
+        "/testing.file",
+        get_file_path(static_file_directory, file_name),
+    )
+
+    request, response = app.test_client.get("/testing.file")
+    assert response.status == 200
+    assert response.body == get_file_content(static_file_directory, file_name)
+    assert response.headers["Content-Type"] == expected
+
+
+def test_static_file_content_type_with_charset(app, static_file_directory):
+    app.static(
+        "/testing.file",
+        get_file_path(static_file_directory, "decode me.txt"),
+        content_type="text/plain;charset=ISO-8859-1",
+    )
+
+    request, response = app.test_client.get("/testing.file")
+    assert response.status == 200
+    assert response.headers["Content-Type"] == "text/plain;charset=ISO-8859-1"
 
 
 @pytest.mark.parametrize(
@@ -374,3 +450,129 @@ def test_static_name(app, static_file_directory, static_name, file_name):
     request, response = app.test_client.get(f"/static/{file_name}")
 
     assert response.status == 200
+
+
+def test_nested_dir(app, static_file_directory):
+    app.static("/static", static_file_directory)
+
+    request, response = app.test_client.get("/static/nested/dir/foo.txt")
+
+    assert response.status == 200
+    assert response.text == "foo\n"
+
+
+def test_handle_is_a_directory_error(app, static_file_directory):
+    error_text = "Is a directory. Access denied"
+    app.static("/static", static_file_directory)
+
+    @app.exception(Exception)
+    async def handleStaticDirError(request, exception):
+        if isinstance(exception, IsADirectoryError):
+            return text(error_text, status=403)
+        raise exception
+
+    request, response = app.test_client.get("/static/")
+
+    assert response.status == 403
+    assert response.text == error_text
+
+
+def test_stack_trace_on_not_found(app, static_file_directory, caplog):
+    app.static("/static", static_file_directory)
+
+    with caplog.at_level(logging.INFO):
+        _, response = app.test_client.get("/static/non_existing_file.file")
+
+    counter = Counter([r[1] for r in caplog.record_tuples])
+
+    assert response.status == 404
+    assert counter[logging.INFO] == 5
+    assert counter[logging.ERROR] == 0
+
+
+def test_no_stack_trace_on_not_found(app, static_file_directory, caplog):
+    app.static("/static", static_file_directory)
+
+    @app.exception(FileNotFound)
+    async def file_not_found(request, exception):
+        return text(f"No file: {request.path}", status=404)
+
+    with caplog.at_level(logging.INFO):
+        _, response = app.test_client.get("/static/non_existing_file.file")
+
+    counter = Counter([r[1] for r in caplog.record_tuples])
+
+    assert response.status == 404
+    assert counter[logging.INFO] == 5
+    assert logging.ERROR not in counter
+    assert response.text == "No file: /static/non_existing_file.file"
+
+
+def test_multiple_statics(app, static_file_directory):
+    app.static("/file", get_file_path(static_file_directory, "test.file"))
+    app.static("/png", get_file_path(static_file_directory, "python.png"))
+
+    _, response = app.test_client.get("/file")
+    assert response.status == 200
+    assert response.body == get_file_content(
+        static_file_directory, "test.file"
+    )
+
+    _, response = app.test_client.get("/png")
+    assert response.status == 200
+    assert response.body == get_file_content(
+        static_file_directory, "python.png"
+    )
+
+
+def test_resource_type_default(app, static_file_directory):
+    app.static("/static", static_file_directory)
+    app.static("/file", get_file_path(static_file_directory, "test.file"))
+
+    _, response = app.test_client.get("/static")
+    assert response.status == 404
+
+    _, response = app.test_client.get("/file")
+    assert response.status == 200
+    assert response.body == get_file_content(
+        static_file_directory, "test.file"
+    )
+
+
+def test_resource_type_file(app, static_file_directory):
+    app.static(
+        "/file",
+        get_file_path(static_file_directory, "test.file"),
+        resource_type="file",
+    )
+
+    _, response = app.test_client.get("/file")
+    assert response.status == 200
+    assert response.body == get_file_content(
+        static_file_directory, "test.file"
+    )
+
+    with pytest.raises(TypeError):
+        app.static("/static", static_file_directory, resource_type="file")
+
+
+def test_resource_type_dir(app, static_file_directory):
+    app.static("/static", static_file_directory, resource_type="dir")
+
+    _, response = app.test_client.get("/static/test.file")
+    assert response.status == 200
+    assert response.body == get_file_content(
+        static_file_directory, "test.file"
+    )
+
+    with pytest.raises(TypeError):
+        app.static(
+            "/file",
+            get_file_path(static_file_directory, "test.file"),
+            resource_type="dir",
+        )
+
+
+def test_resource_type_unknown(app, static_file_directory, caplog):
+    with pytest.raises(ValueError):
+        app.static("/static", static_file_directory, resource_type="unknown")

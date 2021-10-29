@@ -1,9 +1,11 @@
 import asyncio
 import logging
 import os
+import platform
 import subprocess
 import sys
 
+import httpcore
 import httpx
 import pytest
 
@@ -139,8 +141,9 @@ def test_unix_connection():
 
     @app.listener("after_server_start")
     async def client(app, loop):
+        transport = httpcore.AsyncConnectionPool(uds=SOCKPATH)
         try:
-            async with httpx.AsyncClient(uds=SOCKPATH) as client:
+            async with httpx.AsyncClient(transport=transport) as client:
                 r = await client.get("http://myhost.invalid/")
                 assert r.status_code == 200
                 assert r.text == os.path.abspath(SOCKPATH)
@@ -173,14 +176,19 @@ def test_unix_connection_multiple_workers():
     app_multi.run(host="myhost.invalid", unix=SOCKPATH, workers=2)
 
 
+@pytest.mark.xfail(
+    condition=platform.system() != "Linux",
+    reason="Flaky Test on Non Linux Infra",
+)
 async def test_zero_downtime():
     """Graceful server termination and socket replacement on restarts"""
     from signal import SIGINT
     from time import monotonic as current_time
 
     async def client():
+        transport = httpcore.AsyncConnectionPool(uds=SOCKPATH)
         for _ in range(40):
-            async with httpx.AsyncClient(uds=SOCKPATH) as client:
+            async with httpx.AsyncClient(transport=transport) as client:
                 r = await client.get("http://localhost/sleep/0.1")
                 assert r.status_code == 200
                 assert r.text == f"Slept 0.1 seconds.\n"

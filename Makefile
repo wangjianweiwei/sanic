@@ -49,6 +49,9 @@ test: clean
 test-coverage: clean
 	python setup.py test --pytest-args="--cov sanic --cov-report term --cov-append "
 
+view-coverage:
+	sanic ./coverage --simple
+
 install:
 	python setup.py install
 
@@ -63,16 +66,17 @@ ifdef include_tests
 	isort -rc sanic tests
 else
 	$(info Sorting Imports)
-	isort -rc sanic tests
+	isort -rc sanic tests  --profile=black
 endif
 endif
 
 black:
 	black --config ./.black.toml sanic tests
 
-fix-import: black
-	isort sanic tests
+isort:
+	isort sanic tests --profile=black
 
+pretty: black isort
 
 docs-clean:
 	cd docs && make clean
@@ -82,6 +86,9 @@ docs: docs-clean
 
 docs-test: docs-clean
 	cd docs && make dummy
+
+docs-serve:
+	sphinx-autobuild docs docs/_build/html --port 9999 --watch ./
 
 changelog:
 	python scripts/changelog.py

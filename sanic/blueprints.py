@@ -1,94 +1,262 @@
-from collections import defaultdict, namedtuple
+from __future__ import annotations
 
+import asyncio
+
+from collections import defaultdict
+from copy import deepcopy
+from types import SimpleNamespace
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Union,
+)
+
+from sanic_routing.exceptions import NotFound  # type: ignore
+from sanic_routing.route import Route  # type: ignore
+
+from sanic.base import BaseSanic
 from sanic.blueprint_group import BlueprintGroup
-from sanic.constants import HTTP_METHODS
-from sanic.views import CompositionView
+from sanic.exceptions import SanicException
+from sanic.helpers import Default, _default
+from sanic.models.futures import FutureRoute, FutureStatic
+from sanic.models.handler_types import (
+    ListenerType,
+    MiddlewareType,
+    RouteHandler,
+)
 
 
-FutureRoute = namedtuple(
-    "FutureRoute",
-    [
-        "handler",
-        "uri",
-        "methods",
+if TYPE_CHECKING:
+    from sanic import Sanic  # noqa
+
+
+class Blueprint(BaseSanic):
+    """
+    In *Sanic* terminology, a **Blueprint** is a logical collection of
+    URLs that perform a specific set of tasks which can be identified by
+    a unique name.
+
+    It is the main tool for grouping functionality and similar endpoints.
+
+    `See user guide re: blueprints
+    <https://sanicframework.org/guide/best-practices/blueprints.html>`__
+
+    :param name: unique name of the blueprint
+    :param url_prefix: URL to be prefixed before all route URLs
+    :param host: IP Address of FQDN for the sanic server to use.
+    :param version: Blueprint Version
+    :param strict_slashes: Enforce the API urls are requested with a
+        trailing */*
+    """
+
+    __fake_slots__ = (
+        "_apps",
+        "_future_routes",
+        "_future_statics",
+        "_future_middleware",
+        "_future_listeners",
+        "_future_exceptions",
+        "_future_signals",
+        "ctx",
+        "exceptions",
         "host",
-        "strict_slashes",
-        "stream",
-        "version",
+        "listeners",
+        "middlewares",
         "name",
-    ],
-)
-FutureListener = namedtuple(
-    "FutureListener", ["handler", "uri", "methods", "host"]
-)
-FutureMiddleware = namedtuple(
-    "FutureMiddleware", ["middleware", "args", "kwargs"]
-)
-FutureException = namedtuple("FutureException", ["handler", "args", "kwargs"])
-FutureStatic = namedtuple(
-    "FutureStatic", ["uri", "file_or_directory", "args", "kwargs"]
-)
+        "routes",
+        "statics",
+        "strict_slashes",
+        "url_prefix",
+        "version",
+        "version_prefix",
+        "websocket_routes",
+    )
 
-
-class Blueprint:
     def __init__(
         self,
-        name,
-        url_prefix=None,
-        host=None,
-        version=None,
-        strict_slashes=None,
+        name: str = None,
+        url_prefix: Optional[str] = None,
+        host: Optional[str] = None,
+        version: Optional[Union[int, str, float]] = None,
+        strict_slashes: Optional[bool] = None,
+        version_prefix: str = "/v",
+    ):
+        super().__init__(name=name)
+        self.reset()
+        self.ctx = SimpleNamespace()
+        self.host = host
+        self.strict_slashes = strict_slashes
+        self.url_prefix = (
+            url_prefix[:-1]
+            if url_prefix and url_prefix.endswith("/")
+            else url_prefix
+        )
+        self.version = version
+        self.version_prefix = version_prefix
+
+    def __repr__(self) -> str:
+        args = ", ".join(
+            [
+                f'{attr}="{getattr(self, attr)}"'
+                if isinstance(getattr(self, attr), str)
+                else f"{attr}={getattr(self, attr)}"
+                for attr in (
+                    "name",
+                    "url_prefix",
+                    "host",
+                    "version",
+                    "strict_slashes",
+                )
+            ]
+        )
+        return f"Blueprint({args})"
+
+    @property
+    def apps(self):
+        if not self._apps:
+            raise SanicException(
+                f"{self} has not yet been registered to an app"
+            )
+        return self._apps
+
+    def route(self, *args, **kwargs):
+        kwargs["apply"] = False
+        return super().route(*args, **kwargs)
+
+    def static(self, *args, **kwargs):
+        kwargs["apply"] = False
+        return super().static(*args, **kwargs)
+
+    def middleware(self, *args, **kwargs):
+        kwargs["apply"] = False
+        return super().middleware(*args, **kwargs)
+
+    def listener(self, *args, **kwargs):
+        kwargs["apply"] = False
+        return super().listener(*args, **kwargs)
+
+    def exception(self, *args, **kwargs):
+        kwargs["apply"] = False
+        return super().exception(*args, **kwargs)
+
+    def signal(self, event: str, *args, **kwargs):
+        kwargs["apply"] = False
+        return super().signal(event, *args, **kwargs)
+
+    def reset(self):
+        self._apps: Set[Sanic] = set()
+        self.exceptions: List[RouteHandler] = []
+        self.listeners: Dict[str, List[ListenerType[Any]]] = {}
+        self.middlewares: List[MiddlewareType] = []
+        self.routes: List[Route] = []
+        self.statics: List[RouteHandler] = []
+        self.websocket_routes: List[Route] = []
+
+    def copy(
+        self,
+        name: str,
+        url_prefix: Optional[Union[str, Default]] = _default,
+        version: Optional[Union[int, str, float, Default]] = _default,
+        version_prefix: Union[str, Default] = _default,
+        strict_slashes: Optional[Union[bool, Default]] = _default,
+        with_registration: bool = True,
+        with_ctx: bool = False,
     ):
         """
-        In *Sanic* terminology, a **Blueprint** is a logical collection of
-        URLs that perform a specific set of tasks which can be identified by
-        a unique name.
+        Copy a blueprint instance with some optional parameters to
+        override the values of attributes in the old instance.
 
         :param name: unique name of the blueprint
         :param url_prefix: URL to be prefixed before all route URLs
-        :param host: IP Address of FQDN for the sanic server to use.
         :param version: Blueprint Version
+        :param version_prefix: the prefix of the version number shown in the
+            URL.
         :param strict_slashes: Enforce the API urls are requested with a
-            training */*
+            trailing */*
+        :param with_registration: whether register new blueprint instance with
+            sanic apps that were registered with the old instance or not.
+        :param with_ctx: whether ``ctx`` will be copied or not.
         """
-        self.name = name
-        self.url_prefix = url_prefix
-        self.host = host
 
-        self.routes = []
-        self.websocket_routes = []
-        self.exceptions = []
-        self.listeners = defaultdict(list)
-        self.middlewares = []
-        self.statics = []
-        self.version = version
-        self.strict_slashes = strict_slashes
+        attrs_backup = {
+            "_apps": self._apps,
+            "routes": self.routes,
+            "websocket_routes": self.websocket_routes,
+            "middlewares": self.middlewares,
+            "exceptions": self.exceptions,
+            "listeners": self.listeners,
+            "statics": self.statics,
+        }
+
+        self.reset()
+        new_bp = deepcopy(self)
+        new_bp.name = name
+
+        if not isinstance(url_prefix, Default):
+            new_bp.url_prefix = url_prefix
+        if not isinstance(version, Default):
+            new_bp.version = version
+        if not isinstance(strict_slashes, Default):
+            new_bp.strict_slashes = strict_slashes
+        if not isinstance(version_prefix, Default):
+            new_bp.version_prefix = version_prefix
+
+        for key, value in attrs_backup.items():
+            setattr(self, key, value)
+
+        if with_registration and self._apps:
+            if new_bp._future_statics:
+                raise SanicException(
+                    "Static routes registered with the old blueprint instance,"
+                    " cannot be registered again."
+                )
+            for app in self._apps:
+                app.blueprint(new_bp)
+
+        if not with_ctx:
+            new_bp.ctx = SimpleNamespace()
+
+        return new_bp
 
     @staticmethod
-    def group(*blueprints, url_prefix=""):
+    def group(
+        *blueprints: Union[Blueprint, BlueprintGroup],
+        url_prefix: Optional[str] = None,
+        version: Optional[Union[int, str, float]] = None,
+        strict_slashes: Optional[bool] = None,
+        version_prefix: str = "/v",
+    ) -> BlueprintGroup:
         """
         Create a list of blueprints, optionally grouping them under a
         general URL prefix.
 
         :param blueprints: blueprints to be registered as a group
         :param url_prefix: URL route to be prepended to all sub-prefixes
+        :param version: API Version to be used for Blueprint group
+        :param strict_slashes: Indicate strict slash termination behavior
+            for URL
         """
 
-        def chain(nested):
+        def chain(nested) -> Iterable[Blueprint]:
             """itertools.chain() but leaves strings untouched"""
             for i in nested:
                 if isinstance(i, (list, tuple)):
                     yield from chain(i)
-                elif isinstance(i, BlueprintGroup):
-                    yield from i.blueprints
                 else:
                     yield i
 
-        bps = BlueprintGroup(url_prefix=url_prefix)
+        bps = BlueprintGroup(
+            url_prefix=url_prefix,
+            version=version,
+            strict_slashes=strict_slashes,
+            version_prefix=version_prefix,
+        )
         for bp in chain(blueprints):
-            if bp.url_prefix is None:
-                bp.url_prefix = ""
-            bp.url_prefix = url_prefix + bp.url_prefix
             bps.append(bp)
         return bps
 
@@ -102,476 +270,135 @@ class Blueprint:
             *url_prefix* - URL Prefix to override the blueprint prefix
         """
 
+        self._apps.add(app)
         url_prefix = options.get("url_prefix", self.url_prefix)
+        opt_version = options.get("version", None)
+        opt_strict_slashes = options.get("strict_slashes", None)
+        opt_version_prefix = options.get("version_prefix", self.version_prefix)
+        error_format = options.get(
+            "error_format", app.config.FALLBACK_ERROR_FORMAT
+        )
 
         routes = []
+        middleware = []
+        exception_handlers = []
+        listeners = defaultdict(list)
 
         # Routes
-        for future in self.routes:
+        for future in self._future_routes:
             # attach the blueprint name to the handler so that it can be
             # prefixed properly in the router
             future.handler.__blueprintname__ = self.name
             # Prepend the blueprint URI prefix if available
             uri = url_prefix + future.uri if url_prefix else future.uri
 
-            version = future.version or self.version
+            version_prefix = self.version_prefix
+            for prefix in (
+                future.version_prefix,
+                opt_version_prefix,
+            ):
+                if prefix and prefix != "/v":
+                    version_prefix = prefix
+                    break
 
-            _routes, _ = app.route(
-                uri=uri[1:] if uri.startswith("//") else uri,
-                methods=future.methods,
-                host=future.host or self.host,
-                strict_slashes=future.strict_slashes,
-                stream=future.stream,
-                version=version,
-                name=future.name,
-            )(future.handler)
-            if _routes:
-                routes += _routes
-
-        for future in self.websocket_routes:
-            # attach the blueprint name to the handler so that it can be
-            # prefixed properly in the router
-            future.handler.__blueprintname__ = self.name
-            # Prepend the blueprint URI prefix if available
-            uri = url_prefix + future.uri if url_prefix else future.uri
-            _routes, _ = app.websocket(
-                uri=uri,
-                host=future.host or self.host,
-                strict_slashes=future.strict_slashes,
-                name=future.name,
-            )(future.handler)
-            if _routes:
-                routes += _routes
-
-        route_names = [route.name for route in routes if route]
-        # Middleware
-        for future in self.middlewares:
-            if future.args or future.kwargs:
-                app.register_named_middleware(
-                    future.middleware,
-                    route_names,
-                    *future.args,
-                    **future.kwargs,
-                )
-            else:
-                app.register_named_middleware(future.middleware, route_names)
-
-        # Exceptions
-        for future in self.exceptions:
-            app.exception(*future.args, **future.kwargs)(future.handler)
-
-        # Static Files
-        for future in self.statics:
-            # Prepend the blueprint URI prefix if available
-            uri = url_prefix + future.uri if url_prefix else future.uri
-            app.static(
-                uri, future.file_or_directory, *future.args, **future.kwargs
+            version = self._extract_value(
+                future.version, opt_version, self.version
+            )
+            strict_slashes = self._extract_value(
+                future.strict_slashes, opt_strict_slashes, self.strict_slashes
             )
 
-        # Event listeners
-        for event, listeners in self.listeners.items():
-            for listener in listeners:
-                app.listener(event)(listener)
+            name = app._generate_name(future.name)
 
-    def route(
-        self,
-        uri,
-        methods=frozenset({"GET"}),
-        host=None,
-        strict_slashes=None,
-        stream=False,
-        version=None,
-        name=None,
-    ):
-        """Create a blueprint route from a decorated function.
-
-        :param uri: endpoint at which the route will be accessible.
-        :param methods: list of acceptable HTTP methods.
-        :param host: IP Address of FQDN for the sanic server to use.
-        :param strict_slashes: Enforce the API urls are requested with a
-            training */*
-        :param stream: If the route should provide a streaming support
-        :param version: Blueprint Version
-        :param name: Unique name to identify the Route
-
-        :return a decorated method that when invoked will return an object
-            of type :class:`FutureRoute`
-        """
-        if strict_slashes is None:
-            strict_slashes = self.strict_slashes
-
-        def decorator(handler):
-            route = FutureRoute(
-                handler,
-                uri,
-                methods,
-                host,
+            apply_route = FutureRoute(
+                future.handler,
+                uri[1:] if uri.startswith("//") else uri,
+                future.methods,
+                future.host or self.host,
                 strict_slashes,
-                stream,
+                future.stream,
                 version,
                 name,
+                future.ignore_body,
+                future.websocket,
+                future.subprotocols,
+                future.unquote,
+                future.static,
+                version_prefix,
+                error_format,
             )
-            self.routes.append(route)
-            return handler
 
-        return decorator
-
-    def add_route(
-        self,
-        handler,
-        uri,
-        methods=frozenset({"GET"}),
-        host=None,
-        strict_slashes=None,
-        version=None,
-        name=None,
-        stream=False,
-    ):
-        """Create a blueprint route from a function.
-
-        :param handler: function for handling uri requests. Accepts function,
-                        or class instance with a view_class method.
-        :param uri: endpoint at which the route will be accessible.
-        :param methods: list of acceptable HTTP methods.
-        :param host: IP Address of FQDN for the sanic server to use.
-        :param strict_slashes: Enforce the API urls are requested with a
-            training */*
-        :param version: Blueprint Version
-        :param name: user defined route name for url_for
-        :param stream: boolean specifying if the handler is a stream handler
-        :return: function or class instance
-        """
-        # Handle HTTPMethodView differently
-        if hasattr(handler, "view_class"):
-            methods = set()
-
-            for method in HTTP_METHODS:
-                if getattr(handler.view_class, method.lower(), None):
-                    methods.add(method)
-
-        if strict_slashes is None:
-            strict_slashes = self.strict_slashes
-
-        # handle composition view differently
-        if isinstance(handler, CompositionView):
-            methods = handler.handlers.keys()
-
-        self.route(
-            uri=uri,
-            methods=methods,
-            host=host,
-            strict_slashes=strict_slashes,
-            stream=stream,
-            version=version,
-            name=name,
-        )(handler)
-        return handler
-
-    def websocket(
-        self, uri, host=None, strict_slashes=None, version=None, name=None
-    ):
-        """Create a blueprint websocket route from a decorated function.
-
-        :param uri: endpoint at which the route will be accessible.
-        :param host: IP Address of FQDN for the sanic server to use.
-        :param strict_slashes: Enforce the API urls are requested with a
-            training */*
-        :param version: Blueprint Version
-        :param name: Unique name to identify the Websocket Route
-        """
-        if strict_slashes is None:
-            strict_slashes = self.strict_slashes
-
-        def decorator(handler):
-            nonlocal uri
-            nonlocal host
-            nonlocal strict_slashes
-            nonlocal version
-            nonlocal name
-
-            name = f"{self.name}.{name or handler.__name__}"
-            route = FutureRoute(
-                handler, uri, [], host, strict_slashes, False, version, name
+            route = app._apply_route(apply_route)
+            operation = (
+                routes.extend if isinstance(route, list) else routes.append
             )
-            self.websocket_routes.append(route)
-            return handler
+            operation(route)
 
-        return decorator
+        # Static Files
+        for future in self._future_statics:
+            # Prepend the blueprint URI prefix if available
+            uri = url_prefix + future.uri if url_prefix else future.uri
+            apply_route = FutureStatic(uri, *future[1:])
+            route = app._apply_static(apply_route)
+            routes.append(route)
 
-    def add_websocket_route(
-        self, handler, uri, host=None, version=None, name=None
-    ):
-        """Create a blueprint websocket route from a function.
+        route_names = [route.name for route in routes if route]
 
-        :param handler: function for handling uri requests. Accepts function,
-                        or class instance with a view_class method.
-        :param uri: endpoint at which the route will be accessible.
-        :param host: IP Address of FQDN for the sanic server to use.
-        :param version: Blueprint Version
-        :param name: Unique name to identify the Websocket Route
-        :return: function or class instance
-        """
-        self.websocket(uri=uri, host=host, version=version, name=name)(handler)
-        return handler
+        if route_names:
+            # Middleware
+            for future in self._future_middleware:
+                middleware.append(app._apply_middleware(future, route_names))
 
-    def listener(self, event):
-        """Create a listener from a decorated function.
+            # Exceptions
+            for future in self._future_exceptions:
+                exception_handlers.append(
+                    app._apply_exception_handler(future, route_names)
+                )
 
-        :param event: Event to listen to.
-        """
+        # Event listeners
+        for listener in self._future_listeners:
+            listeners[listener.event].append(app._apply_listener(listener))
 
-        def decorator(listener):
-            self.listeners[event].append(listener)
-            return listener
+        # Signals
+        for signal in self._future_signals:
+            signal.condition.update({"blueprint": self.name})
+            app._apply_signal(signal)
 
-        return decorator
+        self.routes = [route for route in routes if isinstance(route, Route)]
+        self.websocket_routes = [
+            route for route in self.routes if route.ctx.websocket
+        ]
+        self.middlewares = middleware
+        self.exceptions = exception_handlers
+        self.listeners = dict(listeners)
 
-    def middleware(self, *args, **kwargs):
-        """
-        Create a blueprint middleware from a decorated function.
-
-        :param args: Positional arguments to be used while invoking the
-            middleware
-        :param kwargs: optional keyword args that can be used with the
-            middleware.
-        """
-
-        def register_middleware(_middleware):
-            future_middleware = FutureMiddleware(_middleware, args, kwargs)
-            self.middlewares.append(future_middleware)
-            return _middleware
-
-        # Detect which way this was called, @middleware or @middleware('AT')
-        if len(args) == 1 and len(kwargs) == 0 and callable(args[0]):
-            middleware = args[0]
-            args = []
-            return register_middleware(middleware)
-        else:
-            if kwargs.get("bp_group") and callable(args[0]):
-                middleware = args[0]
-                args = args[1:]
-                kwargs.pop("bp_group")
-                return register_middleware(middleware)
-            else:
-                return register_middleware
-
-    def exception(self, *args, **kwargs):
-        """
-        This method enables the process of creating a global exception
-        handler for the current blueprint under question.
-
-        :param args: List of Python exceptions to be caught by the handler
-        :param kwargs: Additional optional arguments to be passed to the
-            exception handler
-
-        :return a decorated method to handle global exceptions for any
-            route registered under this blueprint.
-        """
-
-        def decorator(handler):
-            exception = FutureException(handler, args, kwargs)
-            self.exceptions.append(exception)
-            return handler
-
-        return decorator
-
-    def static(self, uri, file_or_directory, *args, **kwargs):
-        """Create a blueprint static route from a decorated function.
-
-        :param uri: endpoint at which the route will be accessible.
-        :param file_or_directory: Static asset.
-        """
-        name = kwargs.pop("name", "static")
-        if not name.startswith(self.name + "."):
-            name = f"{self.name}.{name}"
-        kwargs.update(name=name)
-
-        strict_slashes = kwargs.get("strict_slashes")
-        if strict_slashes is None and self.strict_slashes is not None:
-            kwargs.update(strict_slashes=self.strict_slashes)
-
-        static = FutureStatic(uri, file_or_directory, args, kwargs)
-        self.statics.append(static)
-
-    # Shorthand method decorators
-    def get(
-        self, uri, host=None, strict_slashes=None, version=None, name=None
-    ):
-        """
-        Add an API URL under the **GET** *HTTP* method
-
-        :param uri: URL to be tagged to **GET** method of *HTTP*
-        :param host: Host IP or FQDN for the service to use
-        :param strict_slashes: Instruct :class:`sanic.app.Sanic` to check
-            if the request URLs need to terminate with a */*
-        :param version: API Version
-        :param name: Unique name that can be used to identify the Route
-        :return: Object decorated with :func:`route` method
-        """
-        return self.route(
-            uri,
-            methods=frozenset({"GET"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            version=version,
-            name=name,
+    async def dispatch(self, *args, **kwargs):
+        condition = kwargs.pop("condition", {})
+        condition.update({"blueprint": self.name})
+        kwargs["condition"] = condition
+        await asyncio.gather(
+            *[app.dispatch(*args, **kwargs) for app in self.apps]
         )
 
-    def post(
-        self,
-        uri,
-        host=None,
-        strict_slashes=None,
-        stream=False,
-        version=None,
-        name=None,
-    ):
-        """
-        Add an API URL under the **POST** *HTTP* method
+    def event(self, event: str, timeout: Optional[Union[int, float]] = None):
+        events = set()
+        for app in self.apps:
+            signal = app.signal_router.name_index.get(event)
+            if not signal:
+                raise NotFound("Could not find signal %s" % event)
+            events.add(signal.ctx.event)
 
-        :param uri: URL to be tagged to **POST** method of *HTTP*
-        :param host: Host IP or FQDN for the service to use
-        :param strict_slashes: Instruct :class:`sanic.app.Sanic` to check
-            if the request URLs need to terminate with a */*
-        :param version: API Version
-        :param name: Unique name that can be used to identify the Route
-        :return: Object decorated with :func:`route` method
-        """
-        return self.route(
-            uri,
-            methods=frozenset({"POST"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            stream=stream,
-            version=version,
-            name=name,
+        return asyncio.wait(
+            [event.wait() for event in events],
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=timeout,
         )
 
-    def put(
-        self,
-        uri,
-        host=None,
-        strict_slashes=None,
-        stream=False,
-        version=None,
-        name=None,
-    ):
-        """
-        Add an API URL under the **PUT** *HTTP* method
-
-        :param uri: URL to be tagged to **PUT** method of *HTTP*
-        :param host: Host IP or FQDN for the service to use
-        :param strict_slashes: Instruct :class:`sanic.app.Sanic` to check
-            if the request URLs need to terminate with a */*
-        :param version: API Version
-        :param name: Unique name that can be used to identify the Route
-        :return: Object decorated with :func:`route` method
-        """
-        return self.route(
-            uri,
-            methods=frozenset({"PUT"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            stream=stream,
-            version=version,
-            name=name,
-        )
-
-    def head(
-        self, uri, host=None, strict_slashes=None, version=None, name=None
-    ):
-        """
-        Add an API URL under the **HEAD** *HTTP* method
-
-        :param uri: URL to be tagged to **HEAD** method of *HTTP*
-        :param host: Host IP or FQDN for the service to use
-        :param strict_slashes: Instruct :class:`sanic.app.Sanic` to check
-            if the request URLs need to terminate with a */*
-        :param version: API Version
-        :param name: Unique name that can be used to identify the Route
-        :return: Object decorated with :func:`route` method
-        """
-        return self.route(
-            uri,
-            methods=frozenset({"HEAD"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            version=version,
-            name=name,
-        )
-
-    def options(
-        self, uri, host=None, strict_slashes=None, version=None, name=None
-    ):
-        """
-        Add an API URL under the **OPTIONS** *HTTP* method
-
-        :param uri: URL to be tagged to **OPTIONS** method of *HTTP*
-        :param host: Host IP or FQDN for the service to use
-        :param strict_slashes: Instruct :class:`sanic.app.Sanic` to check
-            if the request URLs need to terminate with a */*
-        :param version: API Version
-        :param name: Unique name that can be used to identify the Route
-        :return: Object decorated with :func:`route` method
-        """
-        return self.route(
-            uri,
-            methods=frozenset({"OPTIONS"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            version=version,
-            name=name,
-        )
-
-    def patch(
-        self,
-        uri,
-        host=None,
-        strict_slashes=None,
-        stream=False,
-        version=None,
-        name=None,
-    ):
-        """
-        Add an API URL under the **PATCH** *HTTP* method
-
-        :param uri: URL to be tagged to **PATCH** method of *HTTP*
-        :param host: Host IP or FQDN for the service to use
-        :param strict_slashes: Instruct :class:`sanic.app.Sanic` to check
-            if the request URLs need to terminate with a */*
-        :param version: API Version
-        :param name: Unique name that can be used to identify the Route
-        :return: Object decorated with :func:`route` method
-        """
-        return self.route(
-            uri,
-            methods=frozenset({"PATCH"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            stream=stream,
-            version=version,
-            name=name,
-        )
-
-    def delete(
-        self, uri, host=None, strict_slashes=None, version=None, name=None
-    ):
-        """
-        Add an API URL under the **DELETE** *HTTP* method
-
-        :param uri: URL to be tagged to **DELETE** method of *HTTP*
-        :param host: Host IP or FQDN for the service to use
-        :param strict_slashes: Instruct :class:`sanic.app.Sanic` to check
-            if the request URLs need to terminate with a */*
-        :param version: API Version
-        :param name: Unique name that can be used to identify the Route
-        :return: Object decorated with :func:`route` method
-        """
-        return self.route(
-            uri,
-            methods=frozenset({"DELETE"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            version=version,
-            name=name,
-        )
+    @staticmethod
+    def _extract_value(*values):
+        value = values[-1]
+        for v in values:
+            if v is not None:
+                value = v
+                break
+        return value

@@ -1,6 +1,4 @@
 import logging
-import os
-import ssl
 
 from json import dumps as json_dumps
 from json import loads as json_loads
@@ -8,11 +6,18 @@ from urllib.parse import urlparse
 
 import pytest
 
+from sanic_testing.testing import (
+    ASGI_BASE_URL,
+    ASGI_PORT,
+    HOST,
+    PORT,
+    SanicTestClient,
+)
+
 from sanic import Blueprint, Sanic
 from sanic.exceptions import ServerError
-from sanic.request import DEFAULT_HTTP_CONTENT_TYPE, Request, RequestParameters
+from sanic.request import DEFAULT_HTTP_CONTENT_TYPE, RequestParameters
 from sanic.response import html, json, text
-from sanic.testing import ASGI_HOST, HOST, PORT, SanicTestClient
 
 
 # ------------------------------------------------------------ #
@@ -27,7 +32,7 @@ def test_sync(app):
 
     request, response = app.test_client.get("/")
 
-    assert response.text == "Hello"
+    assert response.body == b"Hello"
 
 
 @pytest.mark.asyncio
@@ -38,7 +43,7 @@ async def test_sync_asgi(app):
 
     request, response = await app.asgi_client.get("/")
 
-    assert response.text == "Hello"
+    assert response.body == b"Hello"
 
 
 def test_ip(app):
@@ -48,18 +53,23 @@ def test_ip(app):
 
     request, response = app.test_client.get("/")
 
-    assert response.text == "127.0.0.1"
+    assert response.body == b"127.0.0.1"
 
 
 @pytest.mark.asyncio
-async def test_ip_asgi(app):
+async def test_url_asgi(app):
     @app.route("/")
     def handler(request):
         return text(f"{request.url}")
 
     request, response = await app.asgi_client.get("/")
 
-    assert response.text == "http://mockserver/"
+    if response.body.decode().endswith("/") and not ASGI_BASE_URL.endswith(
+        "/"
+    ):
+        response.body[:-1] == ASGI_BASE_URL.encode()
+    else:
+        assert response.body == ASGI_BASE_URL.encode()
 
 
 def test_text(app):
@@ -69,7 +79,7 @@ def test_text(app):
 
     request, response = app.test_client.get("/")
 
-    assert response.text == "Hello"
+    assert response.body == b"Hello"
 
 
 def test_html(app):
@@ -98,13 +108,13 @@ def test_html(app):
 
     request, response = app.test_client.get("/")
     assert response.content_type == "text/html; charset=utf-8"
-    assert response.text == "<h1>Hello</h1>"
+    assert response.body == b"<h1>Hello</h1>"
 
     request, response = app.test_client.get("/foo")
-    assert response.text == "<h1>Foo</h1>"
+    assert response.body == b"<h1>Foo</h1>"
 
     request, response = app.test_client.get("/bar")
-    assert response.text == "<h1>Bar object repr</h1>"
+    assert response.body == b"<h1>Bar object repr</h1>"
 
 
 @pytest.mark.asyncio
@@ -115,7 +125,7 @@ async def test_text_asgi(app):
 
     request, response = await app.asgi_client.get("/")
 
-    assert response.text == "Hello"
+    assert response.body == b"Hello"
 
 
 def test_headers(app):
@@ -175,7 +185,7 @@ def test_invalid_response(app):
 
     request, response = app.test_client.get("/")
     assert response.status == 500
-    assert response.text == "Internal Server Error."
+    assert response.body == b"Internal Server Error."
 
 
 @pytest.mark.asyncio
@@ -190,7 +200,7 @@ async def test_invalid_response_asgi(app):
 
     request, response = await app.asgi_client.get("/")
     assert response.status == 500
-    assert response.text == "Internal Server Error."
+    assert response.body == b"Internal Server Error."
 
 
 def test_json(app):
@@ -213,7 +223,7 @@ async def test_json_asgi(app):
 
     request, response = await app.asgi_client.get("/")
 
-    results = json_loads(response.text)
+    results = json_loads(response.body)
 
     assert results.get("test") is True
 
@@ -226,7 +236,7 @@ def test_empty_json(app):
 
     request, response = app.test_client.get("/")
     assert response.status == 200
-    assert response.text == "null"
+    assert response.body == b"null"
 
 
 @pytest.mark.asyncio
@@ -238,7 +248,32 @@ async def test_empty_json_asgi(app):
 
     request, response = await app.asgi_client.get("/")
     assert response.status == 200
-    assert response.text == "null"
+    assert response.body == b"null"
+
+
+def test_echo_json(app):
+    @app.post("/")
+    async def handler(request):
+        return json(request.json)
+
+    data = {"foo": "bar"}
+    request, response = app.test_client.post("/", json=data)
+
+    assert response.status == 200
+    assert response.json == data
+
+
+@pytest.mark.asyncio
+async def test_echo_json_asgi(app):
+    @app.post("/")
+    async def handler(request):
+        return json(request.json)
+
+    data = {"foo": "bar"}
+    request, response = await app.asgi_client.post("/", json=data)
+
+    assert response.status == 200
+    assert response.json == data
 
 
 def test_invalid_json(app):
@@ -278,6 +313,17 @@ def test_query_string(app):
     assert request.args.getlist("test2") == ["false", "true"]
     assert request.args.getlist("test1") == ["1"]
     assert request.args.get("test3", default="My value") == "My value"
+
+
+def test_popped_stays_popped(app):
+    @app.route("/")
+    async def handler(request):
+        return text("OK")
+
+    request, response = app.test_client.get("/", params=[("test1", "1")])
+
+    assert request.args.pop("test1") == ["1"]
+    assert "test1" not in request.args
 
 
 @pytest.mark.asyncio
@@ -412,12 +458,12 @@ def test_content_type(app):
 
     request, response = app.test_client.get("/")
     assert request.content_type == DEFAULT_HTTP_CONTENT_TYPE
-    assert response.text == DEFAULT_HTTP_CONTENT_TYPE
+    assert response.body.decode() == DEFAULT_HTTP_CONTENT_TYPE
 
     headers = {"content-type": "application/json"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.content_type == "application/json"
-    assert response.text == "application/json"
+    assert response.body == b"application/json"
 
 
 @pytest.mark.asyncio
@@ -428,12 +474,12 @@ async def test_content_type_asgi(app):
 
     request, response = await app.asgi_client.get("/")
     assert request.content_type == DEFAULT_HTTP_CONTENT_TYPE
-    assert response.text == DEFAULT_HTTP_CONTENT_TYPE
+    assert response.body.decode() == DEFAULT_HTTP_CONTENT_TYPE
 
     headers = {"content-type": "application/json"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.content_type == "application/json"
-    assert response.text == "application/json"
+    assert response.body == b"application/json"
 
 
 def test_standard_forwarded(app):
@@ -570,14 +616,15 @@ async def test_standard_forwarded_asgi(app):
         "X-Scheme": "ws",
     }
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {"for": "127.0.0.2", "proto": "ws"}
+
+    assert response.json == {"for": "127.0.0.2", "proto": "ws"}
     assert request.remote_addr == "127.0.0.2"
     assert request.scheme == "ws"
-    assert request.server_port == 80
+    assert request.server_port == ASGI_PORT
 
     app.config.FORWARDED_SECRET = "mySecret"
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {
+    assert response.json == {
         "for": "[::2]",
         "proto": "https",
         "host": "me.tld",
@@ -592,13 +639,13 @@ async def test_standard_forwarded_asgi(app):
     # Empty Forwarded header -> use X-headers
     headers["Forwarded"] = ""
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {"for": "127.0.0.2", "proto": "ws"}
+    assert response.json == {"for": "127.0.0.2", "proto": "ws"}
 
     # Header present but not matching anything
     request, response = await app.asgi_client.get(
         "/", headers={"Forwarded": "."}
     )
-    assert response.json() == {}
+    assert response.json == {}
 
     # Forwarded header present but no matching secret -> use X-headers
     headers = {
@@ -606,13 +653,13 @@ async def test_standard_forwarded_asgi(app):
         "X-Real-IP": "127.0.0.2",
     }
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {"for": "127.0.0.2"}
+    assert response.json == {"for": "127.0.0.2"}
     assert request.remote_addr == "127.0.0.2"
 
     # Different formatting and hitting both ends of the header
     headers = {"Forwarded": 'Secret="mySecret";For=127.0.0.4;Port=1234'}
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {
+    assert response.json == {
         "for": "127.0.0.4",
         "port": 1234,
         "secret": "mySecret",
@@ -621,7 +668,7 @@ async def test_standard_forwarded_asgi(app):
     # Test escapes (modify this if you see anyone implementing quoted-pairs)
     headers = {"Forwarded": 'for=test;quoted="\\,x=x;y=\\";secret=mySecret'}
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {
+    assert response.json == {
         "for": "test",
         "quoted": "\\,x=x;y=\\",
         "secret": "mySecret",
@@ -630,17 +677,17 @@ async def test_standard_forwarded_asgi(app):
     # Secret insulated by malformed field #1
     headers = {"Forwarded": "for=test;secret=mySecret;b0rked;proto=wss;"}
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {"for": "test", "secret": "mySecret"}
+    assert response.json == {"for": "test", "secret": "mySecret"}
 
     # Secret insulated by malformed field #2
     headers = {"Forwarded": "for=test;b0rked;secret=mySecret;proto=wss"}
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {"proto": "wss", "secret": "mySecret"}
+    assert response.json == {"proto": "wss", "secret": "mySecret"}
 
     # Unexpected termination should not lose existing acceptable values
     headers = {"Forwarded": "b0rked;secret=mySecret;proto=wss"}
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {"proto": "wss", "secret": "mySecret"}
+    assert response.json == {"proto": "wss", "secret": "mySecret"}
 
     # Field normalization
     headers = {
@@ -648,7 +695,7 @@ async def test_standard_forwarded_asgi(app):
         'PATH="/With%20Spaces%22Quoted%22/sanicApp?key=val";SECRET=mySecret'
     }
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {
+    assert response.json == {
         "proto": "wss",
         "by": "[cafe::8000]",
         "host": "a:2",
@@ -660,7 +707,10 @@ async def test_standard_forwarded_asgi(app):
     app.config.FORWARDED_SECRET = "_proxySecret"
     headers = {"Forwarded": "for=1.2.3.4; by=_proxySecret"}
     request, response = await app.asgi_client.get("/", headers=headers)
-    assert response.json() == {"for": "1.2.3.4", "by": "_proxySecret"}
+    assert response.json == {
+        "for": "1.2.3.4",
+        "by": "_proxySecret",
+    }
 
 
 def test_remote_addr_with_two_proxies(app):
@@ -674,33 +724,33 @@ def test_remote_addr_with_two_proxies(app):
     headers = {"X-Real-IP": "127.0.0.2", "X-Forwarded-For": "127.0.1.1"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.0.2"
-    assert response.text == "127.0.0.2"
+    assert response.body == b"127.0.0.2"
 
     headers = {"X-Forwarded-For": "127.0.1.1"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
     headers = {"X-Forwarded-For": "127.0.0.1, 127.0.1.2"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.0.1"
-    assert response.text == "127.0.0.1"
+    assert response.body == b"127.0.0.1"
 
     request, response = app.test_client.get("/")
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
     headers = {"X-Forwarded-For": "127.0.0.1, ,   ,,127.0.1.2"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.0.1"
-    assert response.text == "127.0.0.1"
+    assert response.body == b"127.0.0.1"
 
     headers = {
         "X-Forwarded-For": ", 127.0.2.2, ,  ,127.0.0.1, ,   ,,127.0.1.2"
     }
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.0.1"
-    assert response.text == "127.0.0.1"
+    assert response.body == b"127.0.0.1"
 
 
 @pytest.mark.asyncio
@@ -715,33 +765,33 @@ async def test_remote_addr_with_two_proxies_asgi(app):
     headers = {"X-Real-IP": "127.0.0.2", "X-Forwarded-For": "127.0.1.1"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.0.2"
-    assert response.text == "127.0.0.2"
+    assert response.body == b"127.0.0.2"
 
     headers = {"X-Forwarded-For": "127.0.1.1"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
     headers = {"X-Forwarded-For": "127.0.0.1, 127.0.1.2"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.0.1"
-    assert response.text == "127.0.0.1"
+    assert response.body == b"127.0.0.1"
 
     request, response = await app.asgi_client.get("/")
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
     headers = {"X-Forwarded-For": "127.0.0.1, ,   ,,127.0.1.2"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.0.1"
-    assert response.text == "127.0.0.1"
+    assert response.body == b"127.0.0.1"
 
     headers = {
         "X-Forwarded-For": ", 127.0.2.2, ,  ,127.0.0.1, ,   ,,127.0.1.2"
     }
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.0.1"
-    assert response.text == "127.0.0.1"
+    assert response.body == b"127.0.0.1"
 
 
 def test_remote_addr_without_proxy(app):
@@ -754,17 +804,17 @@ def test_remote_addr_without_proxy(app):
     headers = {"X-Real-IP": "127.0.0.2", "X-Forwarded-For": "127.0.1.1"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
     headers = {"X-Forwarded-For": "127.0.1.1"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
     headers = {"X-Forwarded-For": "127.0.0.1, 127.0.1.2"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
 
 @pytest.mark.asyncio
@@ -778,17 +828,17 @@ async def test_remote_addr_without_proxy_asgi(app):
     headers = {"X-Real-IP": "127.0.0.2", "X-Forwarded-For": "127.0.1.1"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
     headers = {"X-Forwarded-For": "127.0.1.1"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
     headers = {"X-Forwarded-For": "127.0.0.1, 127.0.1.2"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
 
 def test_remote_addr_custom_headers(app):
@@ -803,17 +853,17 @@ def test_remote_addr_custom_headers(app):
     headers = {"X-Real-IP": "127.0.0.2", "Forwarded": "127.0.1.1"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.1.1"
-    assert response.text == "127.0.1.1"
+    assert response.body == b"127.0.1.1"
 
     headers = {"X-Forwarded-For": "127.0.1.1"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
     headers = {"Client-IP": "127.0.0.2", "Forwarded": "127.0.1.1"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.0.2"
-    assert response.text == "127.0.0.2"
+    assert response.body == b"127.0.0.2"
 
 
 @pytest.mark.asyncio
@@ -829,17 +879,17 @@ async def test_remote_addr_custom_headers_asgi(app):
     headers = {"X-Real-IP": "127.0.0.2", "Forwarded": "127.0.1.1"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.1.1"
-    assert response.text == "127.0.1.1"
+    assert response.body == b"127.0.1.1"
 
     headers = {"X-Forwarded-For": "127.0.1.1"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == ""
-    assert response.text == ""
+    assert response.body == b""
 
     headers = {"Client-IP": "127.0.0.2", "Forwarded": "127.0.1.1"}
     request, response = await app.asgi_client.get("/", headers=headers)
     assert request.remote_addr == "127.0.0.2"
-    assert response.text == "127.0.0.2"
+    assert response.body == b"127.0.0.2"
 
 
 def test_forwarded_scheme(app):
@@ -883,7 +933,7 @@ async def test_match_info_asgi(app):
     request, response = await app.asgi_client.get("/api/v1/user/sanic_user/")
 
     assert request.match_info == {"user_id": "sanic_user"}
-    assert json_loads(response.text) == {"user_id": "sanic_user"}
+    assert json_loads(response.body) == {"user_id": "sanic_user"}
 
 
 # ------------------------------------------------------------ #
@@ -905,7 +955,7 @@ def test_post_json(app):
 
     assert request.json.get("test") == "OK"
     assert request.json.get("test") == "OK"  # for request.parsed_json
-    assert response.text == "OK"
+    assert response.body == b"OK"
 
 
 @pytest.mark.asyncio
@@ -923,7 +973,7 @@ async def test_post_json_asgi(app):
 
     assert request.json.get("test") == "OK"
     assert request.json.get("test") == "OK"  # for request.parsed_json
-    assert response.text == "OK"
+    assert response.body == b"OK"
 
 
 def test_post_form_urlencoded(app):
@@ -1044,9 +1094,9 @@ def test_url_attributes_no_ssl(app, path, query, expected_url):
 @pytest.mark.parametrize(
     "path,query,expected_url",
     [
-        ("/foo", "", "http://{}/foo"),
-        ("/bar/baz", "", "http://{}/bar/baz"),
-        ("/moo/boo", "arg1=val1", "http://{}/moo/boo?arg1=val1"),
+        ("/foo", "", "{}/foo"),
+        ("/bar/baz", "", "{}/bar/baz"),
+        ("/moo/boo", "arg1=val1", "{}/moo/boo?arg1=val1"),
     ],
 )
 @pytest.mark.asyncio
@@ -1057,7 +1107,7 @@ async def test_url_attributes_no_ssl_asgi(app, path, query, expected_url):
     app.add_route(handler, path)
 
     request, response = await app.asgi_client.get(path + f"?{query}")
-    assert request.url == expected_url.format(ASGI_HOST)
+    assert request.url == expected_url.format(ASGI_BASE_URL)
 
     parsed = urlparse(request.url)
 
@@ -1065,92 +1115,6 @@ async def test_url_attributes_no_ssl_asgi(app, path, query, expected_url):
     assert parsed.path == request.path
     assert parsed.query == request.query_string
     assert parsed.netloc == request.host
-
-
-@pytest.mark.parametrize(
-    "path,query,expected_url",
-    [
-        ("/foo", "", "https://{}:{}/foo"),
-        ("/bar/baz", "", "https://{}:{}/bar/baz"),
-        ("/moo/boo", "arg1=val1", "https://{}:{}/moo/boo?arg1=val1"),
-    ],
-)
-def test_url_attributes_with_ssl_context(app, path, query, expected_url):
-    current_dir = os.path.dirname(os.path.realpath(__file__))
-    context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
-    context.load_cert_chain(
-        os.path.join(current_dir, "certs/selfsigned.cert"),
-        keyfile=os.path.join(current_dir, "certs/selfsigned.key"),
-    )
-
-    async def handler(request):
-        return text("OK")
-
-    app.add_route(handler, path)
-
-    port = app.test_client.port
-    request, response = app.test_client.get(
-        f"https://{HOST}:{PORT}" + path + f"?{query}",
-        server_kwargs={"ssl": context},
-    )
-    assert request.url == expected_url.format(HOST, request.server_port)
-
-    parsed = urlparse(request.url)
-
-    assert parsed.scheme == request.scheme
-    assert parsed.path == request.path
-    assert parsed.query == request.query_string
-    assert parsed.netloc == request.host
-
-
-@pytest.mark.parametrize(
-    "path,query,expected_url",
-    [
-        ("/foo", "", "https://{}:{}/foo"),
-        ("/bar/baz", "", "https://{}:{}/bar/baz"),
-        ("/moo/boo", "arg1=val1", "https://{}:{}/moo/boo?arg1=val1"),
-    ],
-)
-def test_url_attributes_with_ssl_dict(app, path, query, expected_url):
-
-    current_dir = os.path.dirname(os.path.realpath(__file__))
-    ssl_cert = os.path.join(current_dir, "certs/selfsigned.cert")
-    ssl_key = os.path.join(current_dir, "certs/selfsigned.key")
-
-    ssl_dict = {"cert": ssl_cert, "key": ssl_key}
-
-    async def handler(request):
-        return text("OK")
-
-    app.add_route(handler, path)
-
-    request, response = app.test_client.get(
-        f"https://{HOST}:{PORT}" + path + f"?{query}",
-        server_kwargs={"ssl": ssl_dict},
-    )
-    assert request.url == expected_url.format(HOST, request.server_port)
-
-    parsed = urlparse(request.url)
-
-    assert parsed.scheme == request.scheme
-    assert parsed.path == request.path
-    assert parsed.query == request.query_string
-    assert parsed.netloc == request.host
-
-
-def test_invalid_ssl_dict(app):
-    @app.get("/test")
-    async def handler(request):
-        return text("ssl test")
-
-    ssl_dict = {"cert": None, "key": None}
-
-    with pytest.raises(ValueError) as excinfo:
-        request, response = app.test_client.get(
-            "/test", server_kwargs={"ssl": ssl_dict}
-        )
-
-    assert str(excinfo.value) == "SSLContext or certificate and key required."
 
 
 def test_form_with_multiple_values(app):
@@ -2109,3 +2073,104 @@ def test_url_for_without_server_name(app):
         response.json["url"]
         == f"http://127.0.0.1:{request.server_port}/url-for"
     )
+
+
+def test_safe_method_with_body_ignored(app):
+    @app.get("/")
+    async def handler(request):
+        return text("OK")
+
+    payload = {"test": "OK"}
+    headers = {"content-type": "application/json"}
+
+    request, response = app.test_client.request(
+        "/", http_method="get", data=json_dumps(payload), headers=headers
+    )
+
+    assert request.body == b""
+    assert request.json == None
+    assert response.body == b"OK"
+
+
+def test_safe_method_with_body(app):
+    @app.get("/", ignore_body=False)
+    async def handler(request):
+        return text("OK")
+
+    payload = {"test": "OK"}
+    headers = {"content-type": "application/json"}
+    data = json_dumps(payload)
+    request, response = app.test_client.request(
+        "/", http_method="get", data=data, headers=headers
+    )
+
+    assert request.body == data.encode("utf-8")
+    assert request.json.get("test") == "OK"
+    assert response.body == b"OK"
+
+
+def test_conflicting_body_methods_overload(app):
+    @app.put("/")
+    @app.put("/p/")
+    @app.put("/p/<foo>")
+    async def put(request, foo=None):
+        return json(
+            {"name": request.route.name, "body": str(request.body), "foo": foo}
+        )
+
+    @app.delete("/p/<foo>")
+    async def delete(request, foo):
+        return json(
+            {"name": request.route.name, "body": str(request.body), "foo": foo}
+        )
+
+    payload = {"test": "OK"}
+    data = str(json_dumps(payload).encode())
+
+    _, response = app.test_client.put("/", json=payload)
+    assert response.status == 200
+    assert response.json == {
+        "name": "test_conflicting_body_methods_overload.put",
+        "foo": None,
+        "body": data,
+    }
+    _, response = app.test_client.put("/p", json=payload)
+    assert response.status == 200
+    assert response.json == {
+        "name": "test_conflicting_body_methods_overload.put",
+        "foo": None,
+        "body": data,
+    }
+    _, response = app.test_client.put("/p/test", json=payload)
+    assert response.status == 200
+    assert response.json == {
+        "name": "test_conflicting_body_methods_overload.put",
+        "foo": "test",
+        "body": data,
+    }
+    _, response = app.test_client.delete("/p/test")
+    assert response.status == 200
+    assert response.json == {
+        "name": "test_conflicting_body_methods_overload.delete",
+        "foo": "test",
+        "body": str("".encode()),
+    }
+
+
+def test_handler_overload(app):
+    @app.get("/long/sub/route/param_a/<param_a:str>/param_b/<param_b:str>")
+    @app.post("/long/sub/route/")
+    def handler(request, **kwargs):
+        return json(kwargs)
+
+    _, response = app.test_client.get(
+        "/long/sub/route/param_a/foo/param_b/bar"
+    )
+    assert response.status == 200
+    assert response.json == {
+        "param_a": "foo",
+        "param_b": "bar",
+    }
+    _, response = app.test_client.post("/long/sub/route")
+    assert response.status == 200
+    assert response.json == {}

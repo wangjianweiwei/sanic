@@ -5,9 +5,10 @@ import codecs
 import os
 import re
 import sys
+
 from distutils.util import strtobool
 
-from setuptools import setup
+from setuptools import find_packages, setup
 from setuptools.command.test import test as TestCommand
 
 
@@ -24,6 +25,7 @@ class PyTest(TestCommand):
 
     def run_tests(self):
         import shlex
+
         import pytest
 
         errno = pytest.main(shlex.split(self.pytest_args))
@@ -38,7 +40,9 @@ def open_local(paths, mode="r", encoding="utf8"):
 
 with open_local(["sanic", "__version__.py"], encoding="latin1") as fp:
     try:
-        version = re.findall(r"^__version__ = \"([^']+)\"\r?$", fp.read(), re.M)[0]
+        version = re.findall(
+            r"^__version__ = \"([^']+)\"\r?$", fp.read(), re.M
+        )[0]
     except IndexError:
         raise RuntimeError("Unable to determine version.")
 
@@ -48,85 +52,94 @@ with open_local(["README.rst"]) as rm:
 setup_kwargs = {
     "name": "sanic",
     "version": version,
-    "url": "http://github.com/huge-success/sanic/",
+    "url": "http://github.com/sanic-org/sanic/",
     "license": "MIT",
     "author": "Sanic Community",
     "author_email": "admhpkns@gmail.com",
     "description": (
-        "A web server and web framework that's written to go fast. Build fast. Run fast."
+        "A web server and web framework that's written to go fast. "
+        "Build fast. Run fast."
     ),
     "long_description": long_description,
-    "packages": ["sanic"],
+    "packages": find_packages(),
+    "package_data": {"sanic": ["py.typed"]},
     "platforms": "any",
-    "python_requires": ">=3.6",
+    "python_requires": ">=3.7",
     "classifiers": [
         "Development Status :: 4 - Beta",
         "Environment :: Web Environment",
         "License :: OSI Approved :: MIT License",
-        "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
     ],
     "entry_points": {"console_scripts": ["sanic = sanic.__main__:main"]},
 }
 
-env_dependency = '; sys_platform != "win32" ' 'and implementation_name == "cpython"'
+env_dependency = (
+    '; sys_platform != "win32" ' 'and implementation_name == "cpython"'
+)
 ujson = "ujson>=1.35" + env_dependency
 uvloop = "uvloop>=0.5.3" + env_dependency
-
+types_ujson = "types-ujson" + env_dependency
 requirements = [
+    "sanic-routing~=0.7",
     "httptools>=0.0.10",
     uvloop,
     ujson,
-    "aiofiles>=0.3.0",
-    "websockets>=8.1,<9.0",
-    "multidict>=4.0,<5.0",
-    "httpx==0.11.1",
+    "aiofiles>=0.6.0",
+    "websockets>=10.0",
+    "multidict>=5.0,<6.0",
 ]
 
 tests_require = [
-    "pytest==5.2.1",
-    "multidict>=4.0,<5.0",
-    "gunicorn",
+    "sanic-testing>=0.7.0",
+    "pytest==6.2.5",
+    "coverage==5.3",
+    "gunicorn==20.0.4",
     "pytest-cov",
-    "httpcore==0.3.0",
     "beautifulsoup4",
-    uvloop,
-    ujson,
     "pytest-sanic",
     "pytest-sugar",
     "pytest-benchmark",
+    "chardet==3.*",
+    "flake8",
+    "black",
+    "isort>=5.0.0",
+    "bandit",
+    "mypy>=0.901",
+    "docutils",
+    "pygments",
+    "uvicorn<0.15.0",
+    types_ujson,
 ]
 
 docs_require = [
     "sphinx>=2.1.2",
-    "sphinx_rtd_theme",
-    "recommonmark>=0.5.0",
+    "sphinx_rtd_theme>=0.4.3",
     "docutils",
     "pygments",
+    "m2r2",
 ]
 
 dev_require = tests_require + [
-    "aiofiles",
+    "cryptography",
     "tox",
-    "black",
-    "flake8",
-    "bandit",
     "towncrier",
 ]
 
-all_require = dev_require + docs_require
+all_require = list(set(dev_require + docs_require))
 
 if strtobool(os.environ.get("SANIC_NO_UJSON", "no")):
     print("Installing without uJSON")
     requirements.remove(ujson)
-    tests_require.remove(ujson)
+    tests_require.remove(types_ujson)
 
 # 'nt' means windows OS
 if strtobool(os.environ.get("SANIC_NO_UVLOOP", "no")):
     print("Installing without uvLoop")
     requirements.remove(uvloop)
-    tests_require.remove(uvloop)
 
 extras_require = {
     "test": tests_require,
