@@ -6,7 +6,10 @@ import string
 import sys
 import uuid
 
-from typing import Tuple
+from contextlib import suppress
+from logging import LogRecord
+from typing import List, Tuple
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -147,6 +150,7 @@ def app(request):
     yield app
     for target, method_name in TouchUp._registry:
         setattr(target, method_name, CACHE[method_name])
+    Sanic._app_registry.clear()
 
 
 @pytest.fixture(scope="function")
@@ -170,3 +174,49 @@ def run_startup(caplog):
         return caplog.record_tuples
 
     return run
+
+
+@pytest.fixture
+def run_multi(caplog):
+    def run(app, level=logging.DEBUG):
+        @app.after_server_start
+        async def stop(app, _):
+            app.stop()
+
+        with caplog.at_level(level):
+            Sanic.serve()
+
+        return caplog.record_tuples
+
+    return run
+
+
+@pytest.fixture(scope="function")
+def message_in_records():
+    def msg_in_log(records: List[LogRecord], msg: str):
+        error_captured = False
+        for record in records:
+            if msg in record.message:
+                error_captured = True
+                break
+        return error_captured
+
+    return msg_in_log
+
+
+@pytest.fixture
+def ext_instance():
+    ext_instance = MagicMock()
+    ext_instance.injection = MagicMock()
+    return ext_instance
+
+
+@pytest.fixture(autouse=True)  # type: ignore
+def sanic_ext(ext_instance):  # noqa
+    sanic_ext = MagicMock(__version__="1.2.3")
+    sanic_ext.Extend = MagicMock()
+    sanic_ext.Extend.return_value = ext_instance
+    sys.modules["sanic_ext"] = sanic_ext
+    yield sanic_ext
+    with suppress(KeyError):
+        del sys.modules["sanic_ext"]

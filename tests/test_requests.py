@@ -1,3 +1,4 @@
+import base64
 import logging
 
 from json import dumps as json_dumps
@@ -18,6 +19,10 @@ from sanic import Blueprint, Sanic
 from sanic.exceptions import ServerError
 from sanic.request import DEFAULT_HTTP_CONTENT_TYPE, RequestParameters
 from sanic.response import html, json, text
+
+
+def encode_basic_auth_credentials(username, password):
+    return base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
 
 
 # ------------------------------------------------------------ #
@@ -362,93 +367,95 @@ async def test_uri_template_asgi(app):
     assert request.uri_template == "/foo/<id:int>/bar/<name:[A-z]+>"
 
 
-def test_token(app):
+@pytest.mark.parametrize(
+    ("auth_type", "token"),
+    [
+        # uuid4 generated token set in "Authorization" header
+        (None, "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"),
+        # uuid4 generated token with API Token authorization
+        ("Token", "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"),
+        # uuid4 generated token with Bearer Token authorization
+        ("Bearer", "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"),
+        # no Authorization header
+        (None, None),
+    ],
+)
+def test_token(app, auth_type, token):
     @app.route("/")
     async def handler(request):
         return text("OK")
 
-    # uuid4 generated token.
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"{token}",
-    }
+    if token:
+        headers = {
+            "content-type": "application/json",
+            "Authorization": f"{auth_type} {token}"
+            if auth_type
+            else f"{token}",
+        }
+    else:
+        headers = {"content-type": "application/json"}
 
     request, response = app.test_client.get("/", headers=headers)
-
     assert request.token == token
 
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Token {token}",
-    }
 
-    request, response = app.test_client.get("/", headers=headers)
-
-    assert request.token == token
-
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-
-    request, response = app.test_client.get("/", headers=headers)
-
-    assert request.token == token
-
-    # no Authorization headers
-    headers = {"content-type": "application/json"}
-
-    request, response = app.test_client.get("/", headers=headers)
-
-    assert request.token is None
-
-
-@pytest.mark.asyncio
-async def test_token_asgi(app):
+@pytest.mark.parametrize(
+    ("auth_type", "token", "username", "password"),
+    [
+        # uuid4 generated token set in "Authorization" header
+        (None, "a1d895e0-553a-421a-8e22-5ff8ecb48cbf", None, None),
+        # uuid4 generated token with API Token authorization
+        ("Token", "a1d895e0-553a-421a-8e22-5ff8ecb48cbf", None, None),
+        # uuid4 generated token with Bearer Token authorization
+        ("Bearer", "a1d895e0-553a-421a-8e22-5ff8ecb48cbf", None, None),
+        # username and password with Basic Auth authorization
+        (
+            "Basic",
+            encode_basic_auth_credentials("some_username", "some_pass"),
+            "some_username",
+            "some_pass",
+        ),
+        # no Authorization header
+        (None, None, None, None),
+    ],
+)
+def test_credentials(app, capfd, auth_type, token, username, password):
     @app.route("/")
     async def handler(request):
         return text("OK")
 
-    # uuid4 generated token.
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"{token}",
-    }
+    if token:
+        headers = {
+            "content-type": "application/json",
+            "Authorization": f"{auth_type} {token}"
+            if auth_type
+            else f"{token}",
+        }
+    else:
+        headers = {"content-type": "application/json"}
 
-    request, response = await app.asgi_client.get("/", headers=headers)
+    request, response = app.test_client.get("/", headers=headers)
 
-    assert request.token == token
+    if auth_type == "Basic":
+        assert request.credentials.username == username
+        assert request.credentials.password == password
+    else:
+        _, err = capfd.readouterr()
+        with pytest.raises(AttributeError):
+            request.credentials.password
+            assert "Password is available for Basic Auth only" in err
+            request.credentials.username
+            assert "Username is available for Basic Auth only" in err
 
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Token {token}",
-    }
-
-    request, response = await app.asgi_client.get("/", headers=headers)
-
-    assert request.token == token
-
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-
-    request, response = await app.asgi_client.get("/", headers=headers)
-
-    assert request.token == token
-
-    # no Authorization headers
-    headers = {"content-type": "application/json"}
-
-    request, response = await app.asgi_client.get("/", headers=headers)
-
-    assert request.token is None
+    if token:
+        assert request.credentials.token == token
+        assert request.credentials.auth_type == auth_type
+    else:
+        assert request.credentials is None
+        assert not hasattr(request.credentials, "token")
+        assert not hasattr(request.credentials, "auth_type")
+        assert not hasattr(request.credentials, "_username")
+        assert not hasattr(request.credentials, "_password")
 
 
 def test_content_type(app):
@@ -1007,6 +1014,72 @@ async def test_post_form_urlencoded_asgi(app):
 
     assert request.form.get("test") == "OK"
     assert request.form.get("test") == "OK"  # For request.parsed_form
+
+
+def test_post_form_urlencoded_keep_blanks(app):
+    @app.route("/", methods=["POST"])
+    async def handler(request):
+        request.get_form(keep_blank_values=True)
+        return text("OK")
+
+    payload = "test="
+    headers = {"content-type": "application/x-www-form-urlencoded"}
+
+    request, response = app.test_client.post(
+        "/", data=payload, headers=headers
+    )
+
+    assert request.form.get("test") == ""
+    assert request.form.get("test") == ""  # For request.parsed_form
+
+
+@pytest.mark.asyncio
+async def test_post_form_urlencoded_keep_blanks_asgi(app):
+    @app.route("/", methods=["POST"])
+    async def handler(request):
+        request.get_form(keep_blank_values=True)
+        return text("OK")
+
+    payload = "test="
+    headers = {"content-type": "application/x-www-form-urlencoded"}
+
+    request, response = await app.asgi_client.post(
+        "/", data=payload, headers=headers
+    )
+
+    assert request.form.get("test") == ""
+    assert request.form.get("test") == ""  # For request.parsed_form
+
+
+def test_post_form_urlencoded_drop_blanks(app):
+    @app.route("/", methods=["POST"])
+    async def handler(request):
+        return text("OK")
+
+    payload = "test="
+    headers = {"content-type": "application/x-www-form-urlencoded"}
+
+    request, response = app.test_client.post(
+        "/", data=payload, headers=headers
+    )
+
+    assert "test" not in request.form.keys()
+
+
+@pytest.mark.asyncio
+async def test_post_form_urlencoded_drop_blanks_asgi(app):
+    @app.route("/", methods=["POST"])
+    async def handler(request):
+        return text("OK")
+
+    payload = "test="
+    headers = {"content-type": "application/x-www-form-urlencoded"}
+
+    request, response = await app.asgi_client.post(
+        "/", data=payload, headers=headers
+    )
+
+    assert "test" not in request.form.keys()
 
 
 @pytest.mark.parametrize(
@@ -1714,7 +1787,6 @@ async def test_request_query_args_custom_parsing_asgi(app):
 
 
 def test_request_cookies(app):
-
     cookies = {"test": "OK"}
 
     @app.get("/")
@@ -1729,7 +1801,6 @@ def test_request_cookies(app):
 
 @pytest.mark.asyncio
 async def test_request_cookies_asgi(app):
-
     cookies = {"test": "OK"}
 
     @app.get("/")
@@ -1979,7 +2050,7 @@ async def test_request_form_invalid_content_type_asgi(app):
 
 
 def test_endpoint_basic():
-    app = Sanic(name=__name__)
+    app = Sanic(name="Test")
 
     @app.route("/")
     def my_unique_handler(request):
@@ -1987,12 +2058,12 @@ def test_endpoint_basic():
 
     request, response = app.test_client.get("/")
 
-    assert request.endpoint == "test_requests.my_unique_handler"
+    assert request.endpoint == "Test.my_unique_handler"
 
 
 @pytest.mark.asyncio
 async def test_endpoint_basic_asgi():
-    app = Sanic(name=__name__)
+    app = Sanic(name="Test")
 
     @app.route("/")
     def my_unique_handler(request):
@@ -2000,7 +2071,7 @@ async def test_endpoint_basic_asgi():
 
     request, response = await app.asgi_client.get("/")
 
-    assert request.endpoint == "test_requests.my_unique_handler"
+    assert request.endpoint == "Test.my_unique_handler"
 
 
 def test_endpoint_named_app():

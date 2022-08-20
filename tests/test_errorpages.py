@@ -1,8 +1,10 @@
 import pytest
 
 from sanic import Sanic
+from sanic.config import Config
 from sanic.errorpages import HTMLRenderer, exception_response
 from sanic.exceptions import NotFound, SanicException
+from sanic.handlers import ErrorHandler
 from sanic.request import Request
 from sanic.response import HTTPResponse, html, json, text
 
@@ -65,7 +67,7 @@ def test_auto_fallback_with_data(app):
 
     _, response = app.test_client.get("/error")
     assert response.status == 500
-    assert response.content_type == "text/html; charset=utf-8"
+    assert response.content_type == "text/plain; charset=utf-8"
 
     _, response = app.test_client.post("/error", json={"foo": "bar"})
     assert response.status == 500
@@ -73,7 +75,7 @@ def test_auto_fallback_with_data(app):
 
     _, response = app.test_client.post("/error", data={"foo": "bar"})
     assert response.status == 500
-    assert response.content_type == "text/html; charset=utf-8"
+    assert response.content_type == "text/plain; charset=utf-8"
 
 
 def test_auto_fallback_with_content_type(app):
@@ -89,7 +91,7 @@ def test_auto_fallback_with_content_type(app):
         "/error", headers={"content-type": "foo/bar", "accept": "*/*"}
     )
     assert response.status == 500
-    assert response.content_type == "text/html; charset=utf-8"
+    assert response.content_type == "text/plain; charset=utf-8"
 
 
 def test_route_error_format_set_on_auto(app):
@@ -172,6 +174,17 @@ def test_route_error_format_unknown(app):
             ...
 
 
+def test_fallback_with_content_type_html(app):
+    app.config.FALLBACK_ERROR_FORMAT = "auto"
+
+    _, response = app.test_client.get(
+        "/error",
+        headers={"content-type": "application/json", "accept": "text/html"},
+    )
+    assert response.status == 500
+    assert response.content_type == "text/html; charset=utf-8"
+
+
 def test_fallback_with_content_type_mismatch_accept(app):
     app.config.FALLBACK_ERROR_FORMAT = "auto"
 
@@ -184,10 +197,10 @@ def test_fallback_with_content_type_mismatch_accept(app):
 
     _, response = app.test_client.get(
         "/error",
-        headers={"content-type": "text/plain", "accept": "foo/bar"},
+        headers={"content-type": "text/html", "accept": "foo/bar"},
     )
     assert response.status == 500
-    assert response.content_type == "text/html; charset=utf-8"
+    assert response.content_type == "text/plain; charset=utf-8"
 
     app.router.reset()
 
@@ -206,7 +219,7 @@ def test_fallback_with_content_type_mismatch_accept(app):
         headers={"accept": "foo/bar"},
     )
     assert response.status == 500
-    assert response.content_type == "text/html; charset=utf-8"
+    assert response.content_type == "text/plain; charset=utf-8"
     _, response = app.test_client.get(
         "/alt1",
         headers={"accept": "foo/bar,*/*"},
@@ -219,7 +232,7 @@ def test_fallback_with_content_type_mismatch_accept(app):
         headers={"accept": "foo/bar"},
     )
     assert response.status == 500
-    assert response.content_type == "text/html; charset=utf-8"
+    assert response.content_type == "text/plain; charset=utf-8"
     _, response = app.test_client.get(
         "/alt2",
         headers={"accept": "foo/bar,*/*"},
@@ -230,6 +243,13 @@ def test_fallback_with_content_type_mismatch_accept(app):
     _, response = app.test_client.get(
         "/alt3",
         headers={"accept": "foo/bar"},
+    )
+    assert response.status == 500
+    assert response.content_type == "text/plain; charset=utf-8"
+
+    _, response = app.test_client.get(
+        "/alt3",
+        headers={"accept": "foo/bar,text/html"},
     )
     assert response.status == 500
     assert response.content_type == "text/html; charset=utf-8"
@@ -271,3 +291,88 @@ def test_combinations_for_auto(fake_request, accept, content_type, expected):
         )
 
     assert response.content_type == expected
+
+
+def test_allow_fallback_error_format_set_main_process_start(app):
+    @app.main_process_start
+    async def start(app, _):
+        app.config.FALLBACK_ERROR_FORMAT = "text"
+
+    _, response = app.test_client.get("/error")
+    assert response.status == 500
+    assert response.content_type == "text/plain; charset=utf-8"
+
+
+def test_setting_fallback_on_config_changes_as_expected(app):
+    app.error_handler = ErrorHandler()
+
+    _, response = app.test_client.get("/error")
+    assert response.content_type == "text/plain; charset=utf-8"
+
+    app.config.FALLBACK_ERROR_FORMAT = "html"
+    _, response = app.test_client.get("/error")
+    assert response.content_type == "text/html; charset=utf-8"
+
+    app.config.FALLBACK_ERROR_FORMAT = "text"
+    _, response = app.test_client.get("/error")
+    assert response.content_type == "text/plain; charset=utf-8"
+
+
+def test_allow_fallback_error_format_in_config_injection():
+    class MyConfig(Config):
+        FALLBACK_ERROR_FORMAT = "text"
+
+    app = Sanic("test", config=MyConfig())
+
+    @app.route("/error", methods=["GET", "POST"])
+    def err(request):
+        raise Exception("something went wrong")
+
+    request, response = app.test_client.get("/error")
+    assert response.status == 500
+    assert response.content_type == "text/plain; charset=utf-8"
+
+
+def test_allow_fallback_error_format_in_config_replacement(app):
+    class MyConfig(Config):
+        FALLBACK_ERROR_FORMAT = "text"
+
+    app.config = MyConfig()
+
+    request, response = app.test_client.get("/error")
+    assert response.status == 500
+    assert response.content_type == "text/plain; charset=utf-8"
+
+
+def test_config_fallback_before_and_after_startup(app):
+    app.config.FALLBACK_ERROR_FORMAT = "json"
+
+    @app.main_process_start
+    async def start(app, _):
+        app.config.FALLBACK_ERROR_FORMAT = "text"
+
+    _, response = app.test_client.get("/error")
+    assert response.status == 500
+    assert response.content_type == "text/plain; charset=utf-8"
+
+
+def test_config_fallback_using_update_dict(app):
+    app.config.update({"FALLBACK_ERROR_FORMAT": "text"})
+
+    _, response = app.test_client.get("/error")
+    assert response.status == 500
+    assert response.content_type == "text/plain; charset=utf-8"
+
+
+def test_config_fallback_using_update_kwarg(app):
+    app.config.update(FALLBACK_ERROR_FORMAT="text")
+
+    _, response = app.test_client.get("/error")
+    assert response.status == 500
+    assert response.content_type == "text/plain; charset=utf-8"
+
+
+def test_config_fallback_bad_value(app):
+    message = "Unknown format: fake"
+    with pytest.raises(SanicException, match=message):
+        app.config.FALLBACK_ERROR_FORMAT = "fake"

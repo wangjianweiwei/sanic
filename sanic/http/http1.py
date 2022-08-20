@@ -8,66 +8,47 @@ if TYPE_CHECKING:
     from sanic.response import BaseHTTPResponse
 
 from asyncio import CancelledError, sleep
-from enum import Enum
 
 from sanic.compat import Header
 from sanic.exceptions import (
-    HeaderExpectationFailed,
-    InvalidUsage,
+    BadRequest,
+    ExpectationFailed,
     PayloadTooLarge,
     ServerError,
     ServiceUnavailable,
 )
 from sanic.headers import format_http1_response
 from sanic.helpers import has_message_body
+from sanic.http.constants import Stage
+from sanic.http.stream import Stream
 from sanic.log import access_logger, error_logger, logger
 from sanic.touchup import TouchUpMeta
-
-
-class Stage(Enum):
-    """
-    Enum for representing the stage of the request/response cycle
-
-    | ``IDLE``  Waiting for request
-    | ``REQUEST``  Request headers being received
-    | ``HANDLER``  Headers done, handler running
-    | ``RESPONSE``  Response headers sent, body in progress
-    | ``FAILED``  Unrecoverable state (error while sending response)
-    |
-    """
-
-    IDLE = 0  # Waiting for request
-    REQUEST = 1  # Request headers being received
-    HANDLER = 3  # Headers done, handler running
-    RESPONSE = 4  # Response headers sent, body in progress
-    FAILED = 100  # Unrecoverable state (error while sending response)
 
 
 HTTP_CONTINUE = b"HTTP/1.1 100 Continue\r\n\r\n"
 
 
-class Http(metaclass=TouchUpMeta):
+class Http(Stream, metaclass=TouchUpMeta):
     """
-    Internal helper for managing the HTTP request/response cycle
+    Internal helper for managing the HTTP/1.1 request/response cycle
 
     :raises ServerError:
     :raises PayloadTooLarge:
     :raises Exception:
-    :raises InvalidUsage:
-    :raises HeaderExpectationFailed:
+    :raises BadRequest:
+    :raises ExpectationFailed:
     :raises RuntimeError:
     :raises ServerError:
     :raises ServerError:
-    :raises InvalidUsage:
-    :raises InvalidUsage:
-    :raises InvalidUsage:
+    :raises BadRequest:
+    :raises BadRequest:
+    :raises BadRequest:
     :raises PayloadTooLarge:
     :raises RuntimeError:
     """
 
     HEADER_CEILING = 16_384
     HEADER_MAX_SIZE = 0
-
     __touchup__ = (
         "http1_request_header",
         "http1_response_header",
@@ -105,7 +86,6 @@ class Http(metaclass=TouchUpMeta):
         self.keep_alive = True
         self.stage: Stage = Stage.IDLE
         self.dispatch = self.protocol.app.dispatch
-        self.init_for_request()
 
     def init_for_request(self):
         """Init/reset all per-request variables."""
@@ -129,14 +109,20 @@ class Http(metaclass=TouchUpMeta):
         """
         HTTP 1.1 connection handler
         """
-        while True:  # As long as connection stays keep-alive
+        # Handle requests while the connection stays reusable
+        while self.keep_alive and self.stage is Stage.IDLE:
+            self.init_for_request()
+            # Wait for incoming bytes (in IDLE stage)
+            if not self.recv_buffer:
+                await self._receive_more()
+            self.stage = Stage.REQUEST
             try:
                 # Receive and handle a request
-                self.stage = Stage.REQUEST
                 self.response_func = self.http1_response_header
 
                 await self.http1_request_header()
 
+                self.stage = Stage.HANDLER
                 self.request.conn_info = self.protocol.conn_info
                 await self.protocol.request_handler(self.request)
 
@@ -186,16 +172,6 @@ class Http(metaclass=TouchUpMeta):
                 self.request.stream = None
                 if self.response:
                     self.response.stream = None
-
-            # Exit and disconnect if no more requests can be taken
-            if self.stage is not Stage.IDLE or not self.keep_alive:
-                break
-
-            self.init_for_request()
-
-            # Wait for the next request
-            if not self.recv_buffer:
-                await self._receive_more()
 
     async def http1_request_header(self):  # no cov
         """
@@ -253,7 +229,7 @@ class Http(metaclass=TouchUpMeta):
 
                 headers.append(h)
         except Exception:
-            raise InvalidUsage("Bad Request")
+            raise BadRequest("Bad Request")
 
         headers_instance = Header(headers)
         self.upgrade_websocket = (
@@ -270,6 +246,7 @@ class Http(metaclass=TouchUpMeta):
             transport=self.protocol.transport,
             app=self.protocol.app,
         )
+        self.protocol.request_class._current.set(request)
         await self.dispatch(
             "http.lifecycle.request",
             inline=True,
@@ -286,7 +263,7 @@ class Http(metaclass=TouchUpMeta):
                 if expect.lower() == "100-continue":
                     self.expecting_continue = True
                 else:
-                    raise HeaderExpectationFailed(f"Unknown Expect: {expect}")
+                    raise ExpectationFailed(f"Unknown Expect: {expect}")
 
             if headers.getone("transfer-encoding", None) == "chunked":
                 self.request_body = "chunked"
@@ -299,7 +276,6 @@ class Http(metaclass=TouchUpMeta):
 
         # Remove header and its trailing CRLF
         del buf[: pos + 4]
-        self.stage = Stage.HANDLER
         self.request, request.stream = request, self
         self.protocol.state["requests_count"] += 1
 
@@ -358,6 +334,12 @@ class Http(metaclass=TouchUpMeta):
             self.response_func = self.head_response_ignored
 
         headers["connection"] = "keep-alive" if self.keep_alive else "close"
+
+        # This header may be removed or modified by the AltSvcCheck Touchup
+        # service. At server start, we either remove this header from ever
+        # being assigned, or we change the value as required.
+        headers["alt-svc"] = ""
+
         ret = format_http1_response(status, res.processed_headers)
         if data:
             ret += data
@@ -516,7 +498,7 @@ class Http(metaclass=TouchUpMeta):
 
                 if len(buf) > 64:
                     self.keep_alive = False
-                    raise InvalidUsage("Bad chunked encoding")
+                    raise BadRequest("Bad chunked encoding")
 
                 await self._receive_more()
 
@@ -524,14 +506,14 @@ class Http(metaclass=TouchUpMeta):
                 size = int(buf[2:pos].split(b";", 1)[0].decode(), 16)
             except Exception:
                 self.keep_alive = False
-                raise InvalidUsage("Bad chunked encoding")
+                raise BadRequest("Bad chunked encoding")
 
             if size <= 0:
                 self.request_body = None
 
                 if size < 0:
                     self.keep_alive = False
-                    raise InvalidUsage("Bad chunked encoding")
+                    raise BadRequest("Bad chunked encoding")
 
                 # Consume CRLF, chunk size 0 and the two CRLF that follow
                 pos += 4
@@ -590,6 +572,11 @@ class Http(metaclass=TouchUpMeta):
             self.stage = Stage.FAILED
             raise RuntimeError("Response already started")
 
+        # Disconnect any earlier but unused response object
+        if self.response is not None:
+            self.response.stream = None
+
+        # Connect and return the response
         self.response, response.stream = response, self
         return response
 

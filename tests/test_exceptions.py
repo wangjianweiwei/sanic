@@ -1,22 +1,36 @@
 import logging
-import warnings
 
 import pytest
 
 from bs4 import BeautifulSoup
-from websockets.version import version as websockets_version
 
 from sanic import Sanic
 from sanic.exceptions import (
+    BadRequest,
+    ContentRangeError,
+    ExpectationFailed,
     Forbidden,
+    HeaderExpectationFailed,
     InvalidUsage,
+    MethodNotAllowed,
+    MethodNotSupported,
     NotFound,
+    RangeNotSatisfiable,
     SanicException,
     ServerError,
     Unauthorized,
-    abort,
 )
 from sanic.response import text
+
+
+def dl_to_dict(soup, css_class):
+    keys, values = [], []
+    for dl in soup.find_all("dl", {"class": css_class}):
+        for dt in dl.find_all("dt"):
+            keys.append(dt.text.strip())
+        for dd in dl.find_all("dd"):
+            values.append(dd.text.strip())
+    return dict(zip(keys, values))
 
 
 class SanicExceptionTestException(Exception):
@@ -26,6 +40,7 @@ class SanicExceptionTestException(Exception):
 @pytest.fixture(scope="module")
 def exception_app():
     app = Sanic("test_exceptions")
+    app.config.FALLBACK_ERROR_FORMAT = "html"
 
     @app.route("/")
     def handler(request):
@@ -69,7 +84,7 @@ def exception_app():
 
     @app.route("/invalid")
     def handler_invalid(request):
-        raise InvalidUsage("OK")
+        raise BadRequest("OK")
 
     @app.route("/abort/401")
     def handler_401_error(request):
@@ -78,10 +93,6 @@ def exception_app():
     @app.route("/abort")
     def handler_500_error(request):
         raise SanicException(status_code=500)
-
-    @app.route("/old_abort")
-    def handler_old_abort_error(request):
-        abort(500)
 
     @app.route("/abort/message")
     def handler_abort_message(request):
@@ -132,7 +143,7 @@ def test_server_error_exception(exception_app):
 
 
 def test_invalid_usage_exception(exception_app):
-    """Test the built-in InvalidUsage exception works"""
+    """Test the built-in BadRequest exception works"""
     request, response = exception_app.test_client.get("/invalid")
     assert response.status == 400
 
@@ -230,11 +241,6 @@ def test_sanic_exception(exception_app):
     assert response.status == 500
     assert "Custom Message" in response.text
 
-    with warnings.catch_warnings(record=True) as w:
-        request, response = exception_app.test_client.get("/old_abort")
-    assert response.status == 500
-    assert len(w) == 1 and "deprecated" in w[0].message.args[0]
-
 
 def test_custom_exception_default_message(exception_app):
     class TeaError(SanicException):
@@ -253,7 +259,7 @@ def test_custom_exception_default_message(exception_app):
 
 
 def test_exception_in_ws_logged(caplog):
-    app = Sanic(__file__)
+    app = Sanic("Test")
 
     @app.websocket("/feed")
     async def feed(request, ws):
@@ -261,14 +267,125 @@ def test_exception_in_ws_logged(caplog):
 
     with caplog.at_level(logging.INFO):
         app.test_client.websocket("/feed")
-    # Websockets v10.0 and above output an additional
-    # INFO message when a ws connection is accepted
-    ws_version_parts = websockets_version.split(".")
-    ws_major = int(ws_version_parts[0])
-    record_index = 2 if ws_major >= 10 else 1
-    assert caplog.record_tuples[record_index][0] == "sanic.error"
-    assert caplog.record_tuples[record_index][1] == logging.ERROR
-    assert (
-        "Exception occurred while handling uri:"
-        in caplog.record_tuples[record_index][2]
-    )
+
+    for record in caplog.record_tuples:
+        if record[2].startswith("Exception occurred"):
+            break
+
+    assert record[0] == "sanic.error"
+    assert record[1] == logging.ERROR
+    assert "Exception occurred while handling uri:" in record[2]
+
+
+@pytest.mark.parametrize("debug", (True, False))
+def test_contextual_exception_context(debug):
+    app = Sanic("Test")
+
+    class TeapotError(SanicException):
+        status_code = 418
+        message = "Sorry, I cannot brew coffee"
+
+    def fail():
+        raise TeapotError(context={"foo": "bar"})
+
+    app.post("/coffee/json", error_format="json")(lambda _: fail())
+    app.post("/coffee/html", error_format="html")(lambda _: fail())
+    app.post("/coffee/text", error_format="text")(lambda _: fail())
+
+    _, response = app.test_client.post("/coffee/json", debug=debug)
+    assert response.status == 418
+    assert response.json["message"] == "Sorry, I cannot brew coffee"
+    assert response.json["context"] == {"foo": "bar"}
+
+    _, response = app.test_client.post("/coffee/html", debug=debug)
+    soup = BeautifulSoup(response.body, "html.parser")
+    dl = dl_to_dict(soup, "context")
+    assert response.status == 418
+    assert "Sorry, I cannot brew coffee" in soup.find("p").text
+    assert dl == {"foo": "bar"}
+
+    _, response = app.test_client.post("/coffee/text", debug=debug)
+    lines = list(map(lambda x: x.decode(), response.body.split(b"\n")))
+    idx = lines.index("Context") + 1
+    assert response.status == 418
+    assert lines[2] == "Sorry, I cannot brew coffee"
+    assert lines[idx] == '    foo: "bar"'
+
+
+@pytest.mark.parametrize("debug", (True, False))
+def test_contextual_exception_extra(debug):
+    app = Sanic("Test")
+
+    class TeapotError(SanicException):
+        status_code = 418
+
+        @property
+        def message(self):
+            return f"Found {self.extra['foo']}"
+
+    def fail():
+        raise TeapotError(extra={"foo": "bar"})
+
+    app.post("/coffee/json", error_format="json")(lambda _: fail())
+    app.post("/coffee/html", error_format="html")(lambda _: fail())
+    app.post("/coffee/text", error_format="text")(lambda _: fail())
+
+    _, response = app.test_client.post("/coffee/json", debug=debug)
+    assert response.status == 418
+    assert response.json["message"] == "Found bar"
+    if debug:
+        assert response.json["extra"] == {"foo": "bar"}
+    else:
+        assert "extra" not in response.json
+
+    _, response = app.test_client.post("/coffee/html", debug=debug)
+    soup = BeautifulSoup(response.body, "html.parser")
+    dl = dl_to_dict(soup, "extra")
+    assert response.status == 418
+    assert "Found bar" in soup.find("p").text
+    if debug:
+        assert dl == {"foo": "bar"}
+    else:
+        assert not dl
+
+    _, response = app.test_client.post("/coffee/text", debug=debug)
+    lines = list(map(lambda x: x.decode(), response.body.split(b"\n")))
+    assert response.status == 418
+    assert lines[2] == "Found bar"
+    if debug:
+        idx = lines.index("Extra") + 1
+        assert lines[idx] == '    foo: "bar"'
+    else:
+        assert "Extra" not in lines
+
+
+@pytest.mark.parametrize("override", (True, False))
+def test_contextual_exception_functional_message(override):
+    app = Sanic("Test")
+
+    class TeapotError(SanicException):
+        status_code = 418
+
+        @property
+        def message(self):
+            return f"Received foo={self.context['foo']}"
+
+    @app.post("/coffee", error_format="json")
+    async def make_coffee(_):
+        error_args = {"context": {"foo": "bar"}}
+        if override:
+            error_args["message"] = "override"
+        raise TeapotError(**error_args)
+
+    _, response = app.test_client.post("/coffee", debug=True)
+    error_message = "override" if override else "Received foo=bar"
+    assert response.status == 418
+    assert response.json["message"] == error_message
+    assert response.json["context"] == {"foo": "bar"}
+
+
+def test_exception_aliases():
+    assert InvalidUsage is BadRequest
+    assert MethodNotSupported is MethodNotAllowed
+    assert ContentRangeError is RangeNotSatisfiable
+    assert HeaderExpectationFailed is ExpectationFailed

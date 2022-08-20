@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from collections import deque, namedtuple
 
@@ -6,11 +7,13 @@ import pytest
 import uvicorn
 
 from sanic import Sanic
+from sanic.application.state import Mode
 from sanic.asgi import MockTransport
-from sanic.exceptions import Forbidden, InvalidUsage, ServiceUnavailable
+from sanic.exceptions import BadRequest, Forbidden, ServiceUnavailable
 from sanic.request import Request
 from sanic.response import json, text
 from sanic.server.websockets.connection import WebSocketConnection
+from sanic.signals import RESERVED_NAMESPACES
 
 
 @pytest.fixture
@@ -44,7 +47,7 @@ def protocol(transport):
     return transport.get_protocol()
 
 
-def test_listeners_triggered():
+def test_listeners_triggered(caplog):
     app = Sanic("app")
     before_server_start = False
     after_server_start = False
@@ -82,8 +85,30 @@ def test_listeners_triggered():
     config = uvicorn.Config(app=app, loop="asyncio", limit_max_requests=0)
     server = CustomServer(config=config)
 
-    with pytest.warns(UserWarning):
+    start_message = (
+        'You have set a listener for "before_server_start" in ASGI mode. '
+        "It will be executed as early as possible, but not before the ASGI "
+        "server is started."
+    )
+    stop_message = (
+        'You have set a listener for "after_server_stop" in ASGI mode. '
+        "It will be executed as late as possible, but not after the ASGI "
+        "server is stopped."
+    )
+
+    with caplog.at_level(logging.DEBUG):
         server.run()
+
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) not in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) not in caplog.record_tuples
 
     all_tasks = asyncio.all_tasks(asyncio.get_event_loop())
     for task in all_tasks:
@@ -94,8 +119,38 @@ def test_listeners_triggered():
     assert before_server_stop
     assert after_server_stop
 
+    app.state.mode = Mode.DEBUG
+    with caplog.at_level(logging.DEBUG):
+        server.run()
 
-def test_listeners_triggered_async(app):
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) not in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) not in caplog.record_tuples
+
+    app.state.verbosity = 2
+    with caplog.at_level(logging.DEBUG):
+        server.run()
+
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) in caplog.record_tuples
+
+
+def test_listeners_triggered_async(app, caplog):
     before_server_start = False
     after_server_start = False
     before_server_stop = False
@@ -132,8 +187,30 @@ def test_listeners_triggered_async(app):
     config = uvicorn.Config(app=app, loop="asyncio", limit_max_requests=0)
     server = CustomServer(config=config)
 
-    with pytest.warns(UserWarning):
+    start_message = (
+        'You have set a listener for "before_server_start" in ASGI mode. '
+        "It will be executed as early as possible, but not before the ASGI "
+        "server is started."
+    )
+    stop_message = (
+        'You have set a listener for "after_server_stop" in ASGI mode. '
+        "It will be executed as late as possible, but not after the ASGI "
+        "server is stopped."
+    )
+
+    with caplog.at_level(logging.DEBUG):
         server.run()
+
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) not in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) not in caplog.record_tuples
 
     all_tasks = asyncio.all_tasks(asyncio.get_event_loop())
     for task in all_tasks:
@@ -143,6 +220,68 @@ def test_listeners_triggered_async(app):
     assert after_server_start
     assert before_server_stop
     assert after_server_stop
+
+    app.state.mode = Mode.DEBUG
+    app.state.verbosity = 0
+    with caplog.at_level(logging.DEBUG):
+        server.run()
+
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) not in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) not in caplog.record_tuples
+
+    app.state.verbosity = 2
+    with caplog.at_level(logging.DEBUG):
+        server.run()
+
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) in caplog.record_tuples
+
+
+def test_non_default_uvloop_config_raises_warning(app):
+    app.config.USE_UVLOOP = True
+
+    class CustomServer(uvicorn.Server):
+        def install_signal_handlers(self):
+            pass
+
+    config = uvicorn.Config(app=app, loop="asyncio", limit_max_requests=0)
+    server = CustomServer(config=config)
+
+    with pytest.warns(UserWarning) as records:
+        server.run()
+
+    all_tasks = asyncio.all_tasks(asyncio.get_event_loop())
+    for task in all_tasks:
+        task.cancel()
+
+    msg = ""
+    for record in records:
+        _msg = str(record.message)
+        if _msg.startswith("You have set the USE_UVLOOP configuration"):
+            msg = _msg
+            break
+
+    assert msg == (
+        "You have set the USE_UVLOOP configuration option, but Sanic "
+        "cannot control the event loop when running in ASGI mode."
+        "This option will be ignored."
+    )
 
 
 @pytest.mark.asyncio
@@ -255,7 +394,7 @@ async def test_websocket_accept_with_multiple_subprotocols(
 
 
 def test_improper_websocket_connection(transport, send, receive):
-    with pytest.raises(InvalidUsage):
+    with pytest.raises(BadRequest):
         transport.get_websocket_connection()
 
     transport.create_websocket_connection(send, receive)
@@ -278,7 +417,7 @@ async def test_request_class_custom():
     class MyCustomRequest(Request):
         pass
 
-    app = Sanic(name=__name__, request_class=MyCustomRequest)
+    app = Sanic(name="Test", request_class=MyCustomRequest)
 
     @app.get("/custom")
     def custom_request(request):
@@ -376,3 +515,44 @@ async def test_request_exception_suppressed_by_middleware(app):
 
     _, response = await app.asgi_client.get("/error-prone")
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_signals_triggered(app):
+    @app.get("/test_signals_triggered")
+    async def _request(request):
+        return text("test_signals_triggered")
+
+    signals_triggered = []
+    signals_expected = [
+        # "http.lifecycle.begin",
+        # "http.lifecycle.read_head",
+        "http.lifecycle.request",
+        "http.lifecycle.handle",
+        "http.routing.before",
+        "http.routing.after",
+        "http.lifecycle.response",
+        # "http.lifecycle.send",
+        # "http.lifecycle.complete",
+    ]
+
+    def signal_handler(signal):
+        return lambda *a, **kw: signals_triggered.append(signal)
+
+    for signal in RESERVED_NAMESPACES["http"]:
+        app.signal(signal)(signal_handler(signal))
+
+    _, response = await app.asgi_client.get("/test_signals_triggered")
+    assert response.status_code == 200
+    assert response.text == "test_signals_triggered"
+    assert signals_triggered == signals_expected
+
+
+@pytest.mark.asyncio
+async def test_asgi_serve_location(app):
+    @app.get("/")
+    def _request(request: Request):
+        return text(request.app.serve_location)
+
+    _, response = await app.asgi_client.get("/")
+    assert response.text == "http://<ASGI>"

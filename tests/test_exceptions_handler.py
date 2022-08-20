@@ -1,21 +1,19 @@
 import asyncio
 import logging
 
-import pytest
+from typing import Callable, List
 from unittest.mock import Mock
 
+import pytest
+
 from bs4 import BeautifulSoup
+from pytest import LogCaptureFixture, MonkeyPatch
 
 from sanic import Sanic, handlers
-from sanic.exceptions import Forbidden, InvalidUsage, NotFound, ServerError
+from sanic.exceptions import BadRequest, Forbidden, NotFound, ServerError
 from sanic.handlers import ErrorHandler
-from sanic.response import stream, text
-
-
-async def sample_streaming_fn(response):
-    await response.write("foo,")
-    await asyncio.sleep(0.001)
-    await response.write("bar")
+from sanic.request import Request
+from sanic.response import text
 
 
 class ErrorWithRequestCtx(ServerError):
@@ -28,7 +26,7 @@ def exception_handler_app():
 
     @exception_handler_app.route("/1", error_format="html")
     def handler_1(request):
-        raise InvalidUsage("OK")
+        raise BadRequest("OK")
 
     @exception_handler_app.route("/2", error_format="html")
     def handler_2(request):
@@ -77,10 +75,10 @@ def exception_handler_app():
 
     @exception_handler_app.exception(Forbidden)
     async def async_handler_exception(request, exception):
-        return stream(
-            sample_streaming_fn,
-            content_type="text/csv",
-        )
+        response = await request.respond(content_type="text/csv")
+        await response.send("foo,")
+        await asyncio.sleep(0.001)
+        await response.send("bar")
 
     @exception_handler_app.middleware
     async def some_request_middleware(request):
@@ -89,35 +87,35 @@ def exception_handler_app():
     return exception_handler_app
 
 
-def test_invalid_usage_exception_handler(exception_handler_app):
+def test_invalid_usage_exception_handler(exception_handler_app: Sanic):
     request, response = exception_handler_app.test_client.get("/1")
     assert response.status == 400
 
 
-def test_server_error_exception_handler(exception_handler_app):
+def test_server_error_exception_handler(exception_handler_app: Sanic):
     request, response = exception_handler_app.test_client.get("/2")
     assert response.status == 200
     assert response.text == "OK"
 
 
-def test_not_found_exception_handler(exception_handler_app):
+def test_not_found_exception_handler(exception_handler_app: Sanic):
     request, response = exception_handler_app.test_client.get("/3")
     assert response.status == 200
 
 
-def test_text_exception__handler(exception_handler_app):
+def test_text_exception__handler(exception_handler_app: Sanic):
     request, response = exception_handler_app.test_client.get("/random")
     assert response.status == 200
     assert response.text == "Done."
 
 
-def test_async_exception_handler(exception_handler_app):
+def test_async_exception_handler(exception_handler_app: Sanic):
     request, response = exception_handler_app.test_client.get("/7")
     assert response.status == 200
     assert response.text == "foo,bar"
 
 
-def test_html_traceback_output_in_debug_mode(exception_handler_app):
+def test_html_traceback_output_in_debug_mode(exception_handler_app: Sanic):
     request, response = exception_handler_app.test_client.get("/4", debug=True)
     assert response.status == 500
     soup = BeautifulSoup(response.body, "html.parser")
@@ -132,12 +130,12 @@ def test_html_traceback_output_in_debug_mode(exception_handler_app):
     ) == summary_text
 
 
-def test_inherited_exception_handler(exception_handler_app):
+def test_inherited_exception_handler(exception_handler_app: Sanic):
     request, response = exception_handler_app.test_client.get("/5")
     assert response.status == 200
 
 
-def test_chained_exception_handler(exception_handler_app):
+def test_chained_exception_handler(exception_handler_app: Sanic):
     request, response = exception_handler_app.test_client.get(
         "/6/0", debug=True
     )
@@ -156,7 +154,7 @@ def test_chained_exception_handler(exception_handler_app):
     ) == summary_text
 
 
-def test_exception_handler_lookup(exception_handler_app):
+def test_exception_handler_lookup(exception_handler_app: Sanic):
     class CustomError(Exception):
         pass
 
@@ -179,7 +177,7 @@ def test_exception_handler_lookup(exception_handler_app):
         class ModuleNotFoundError(ImportError):
             pass
 
-    handler = ErrorHandler("auto")
+    handler = ErrorHandler()
     handler.add(ImportError, import_error_handler)
     handler.add(CustomError, custom_error_handler)
     handler.add(ServerError, server_error_handler)
@@ -204,33 +202,17 @@ def test_exception_handler_lookup(exception_handler_app):
     )
 
 
-def test_exception_handler_processed_request_middleware(exception_handler_app):
+def test_exception_handler_processed_request_middleware(
+    exception_handler_app: Sanic,
+):
     request, response = exception_handler_app.test_client.get("/8")
     assert response.status == 200
     assert response.text == "Done."
 
 
-def test_single_arg_exception_handler_notice(exception_handler_app, caplog):
-    class CustomErrorHandler(ErrorHandler):
-        def lookup(self, exception):
-            return super().lookup(exception, None)
-
-    exception_handler_app.error_handler = CustomErrorHandler()
-
-    with caplog.at_level(logging.WARNING):
-        _, response = exception_handler_app.test_client.get("/1")
-
-    assert caplog.records[0].message == (
-        "You are using a deprecated error handler. The lookup method should "
-        "accept two positional parameters: (exception, route_name: "
-        "Optional[str]). Until you upgrade your ErrorHandler.lookup, "
-        "Blueprint specific exceptions will not work properly. Beginning in "
-        "v22.3, the legacy style lookup method will not work at all."
-    )
-    assert response.status == 400
-
-
-def test_error_handler_noisy_log(exception_handler_app, monkeypatch):
+def test_error_handler_noisy_log(
+    exception_handler_app: Sanic, monkeypatch: MonkeyPatch
+):
     err_logger = Mock()
     monkeypatch.setattr(handlers, "error_logger", err_logger)
 
@@ -243,3 +225,44 @@ def test_error_handler_noisy_log(exception_handler_app, monkeypatch):
     err_logger.exception.assert_called_with(
         "Exception occurred while handling uri: %s", repr(request.url)
     )
+
+
+def test_exception_handler_response_was_sent(
+    app: Sanic,
+    caplog: LogCaptureFixture,
+    message_in_records: Callable[[List[logging.LogRecord], str], bool],
+):
+    exception_handler_ran = False
+
+    @app.exception(ServerError)
+    async def exception_handler(request, exception):
+        nonlocal exception_handler_ran
+        exception_handler_ran = True
+        return text("Error")
+
+    @app.route("/1")
+    async def handler1(request: Request):
+        response = await request.respond()
+        await response.send("some text")
+        raise ServerError("Exception")
+
+    @app.route("/2")
+    async def handler2(request: Request):
+        await request.respond()
+        raise ServerError("Exception")
+
+    with caplog.at_level(logging.WARNING):
+        _, response = app.test_client.get("/1")
+        assert "some text" in response.text
+
+    message_in_records(
+        caplog.records,
+        (
+            "An error occurred while handling the request after at "
+            "least some part of the response was sent to the client. "
+            "Therefore, the response from your custom exception "
+        ),
+    )
+
+    _, response = app.test_client.get("/2")
+    assert "Error" in response.text

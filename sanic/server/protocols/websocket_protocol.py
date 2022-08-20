@@ -5,7 +5,7 @@ from websockets.server import ServerConnection
 from websockets.typing import Subprotocol
 
 from sanic.exceptions import ServerError
-from sanic.log import error_logger
+from sanic.log import logger
 from sanic.server import HttpProtocol
 
 from ..websockets.impl import WebsocketImplProtocol
@@ -16,14 +16,19 @@ if TYPE_CHECKING:
 
 
 class WebSocketProtocol(HttpProtocol):
+    __slots__ = (
+        "websocket",
+        "websocket_timeout",
+        "websocket_max_size",
+        "websocket_ping_interval",
+        "websocket_ping_timeout",
+    )
+
     def __init__(
         self,
         *args,
         websocket_timeout: float = 10.0,
         websocket_max_size: Optional[int] = None,
-        websocket_max_queue: Optional[int] = None,  # max_queue is deprecated
-        websocket_read_limit: Optional[int] = None,  # read_limit is deprecated
-        websocket_write_limit: Optional[int] = None,  # write_limit deprecated
         websocket_ping_interval: Optional[float] = 20.0,
         websocket_ping_timeout: Optional[float] = 20.0,
         **kwargs,
@@ -32,30 +37,6 @@ class WebSocketProtocol(HttpProtocol):
         self.websocket: Optional[WebsocketImplProtocol] = None
         self.websocket_timeout = websocket_timeout
         self.websocket_max_size = websocket_max_size
-        if websocket_max_queue is not None and websocket_max_queue > 0:
-            # TODO: Reminder remove this warning in v22.3
-            error_logger.warning(
-                DeprecationWarning(
-                    "Websocket no longer uses queueing, so websocket_max_queue"
-                    " is no longer required."
-                )
-            )
-        if websocket_read_limit is not None and websocket_read_limit > 0:
-            # TODO: Reminder remove this warning in v22.3
-            error_logger.warning(
-                DeprecationWarning(
-                    "Websocket no longer uses read buffers, so "
-                    "websocket_read_limit is not required."
-                )
-            )
-        if websocket_write_limit is not None and websocket_write_limit > 0:
-            # TODO: Reminder remove this warning in v22.3
-            error_logger.warning(
-                DeprecationWarning(
-                    "Websocket no longer uses write buffers, so "
-                    "websocket_write_limit is not required."
-                )
-            )
         self.websocket_ping_interval = websocket_ping_interval
         self.websocket_ping_timeout = websocket_ping_timeout
 
@@ -123,7 +104,7 @@ class WebSocketProtocol(HttpProtocol):
                 max_size=self.websocket_max_size,
                 subprotocols=subprotocols,
                 state=OPEN,
-                logger=error_logger,
+                logger=logger,
             )
             resp: "http11.Response" = ws_conn.accept(request)
         except Exception:
@@ -138,7 +119,7 @@ class WebSocketProtocol(HttpProtocol):
             ).encode()
             rbody = bytearray(first_line)
             rbody += (
-                "".join(f"{k}: {v}\r\n" for k, v in resp.headers.items())
+                "".join([f"{k}: {v}\r\n" for k, v in resp.headers.items()])
             ).encode()
             rbody += b"\r\n"
             if resp.body is not None:

@@ -5,16 +5,14 @@ from inspect import signature
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from uuid import UUID
 
-from sanic_routing import BaseRouter  # type: ignore
-from sanic_routing.exceptions import NoMethod  # type: ignore
-from sanic_routing.exceptions import (
-    NotFound as RoutingNotFound,  # type: ignore
-)
-from sanic_routing.route import Route  # type: ignore
+from sanic_routing import BaseRouter
+from sanic_routing.exceptions import NoMethod
+from sanic_routing.exceptions import NotFound as RoutingNotFound
+from sanic_routing.route import Route
 
 from sanic.constants import HTTP_METHODS
 from sanic.errorpages import check_error_format
-from sanic.exceptions import MethodNotSupported, NotFound, SanicException
+from sanic.exceptions import MethodNotAllowed, NotFound, SanicException
 from sanic.models.handler_types import RouteHandler
 
 
@@ -43,7 +41,7 @@ class Router(BaseRouter):
         except RoutingNotFound as e:
             raise NotFound("Requested URL {} not found".format(e.path))
         except NoMethod as e:
-            raise MethodNotSupported(
+            raise MethodNotAllowed(
                 "Method {} not allowed for URL {}".format(method, path),
                 method=method,
                 allowed_methods=e.allowed_methods,
@@ -54,7 +52,7 @@ class Router(BaseRouter):
         self, path: str, method: str, host: Optional[str]
     ) -> Tuple[Route, RouteHandler, Dict[str, Any]]:
         """
-        Retrieve a `Route` object containg the details about how to handle
+        Retrieve a `Route` object containing the details about how to handle
         a response for a given request
 
         :param request: the incoming request object
@@ -139,11 +137,10 @@ class Router(BaseRouter):
             route.ctx.stream = stream
             route.ctx.hosts = hosts
             route.ctx.static = static
-            route.ctx.error_format = (
-                error_format or self.ctx.app.config.FALLBACK_ERROR_FORMAT
-            )
+            route.ctx.error_format = error_format
 
-            check_error_format(route.ctx.error_format)
+            if error_format:
+                check_error_format(route.ctx.error_format)
 
             routes.append(route)
 

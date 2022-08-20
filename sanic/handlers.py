@@ -1,13 +1,14 @@
-from inspect import signature
+from __future__ import annotations
+
 from typing import Dict, List, Optional, Tuple, Type
 
-from sanic.errorpages import BaseRenderer, HTMLRenderer, exception_response
+from sanic.errorpages import BaseRenderer, TextRenderer, exception_response
 from sanic.exceptions import (
-    ContentRangeError,
     HeaderNotFound,
     InvalidRangeType,
+    RangeNotSatisfiable,
 )
-from sanic.log import error_logger
+from sanic.log import deprecation, error_logger
 from sanic.models.handler_types import RouteHandler
 from sanic.response import text
 
@@ -25,45 +26,26 @@ class ErrorHandler:
 
     """
 
-    # Beginning in v22.3, the base renderer will be TextRenderer
     def __init__(
-        self, fallback: str = "auto", base: Type[BaseRenderer] = HTMLRenderer
+        self,
+        base: Type[BaseRenderer] = TextRenderer,
     ):
-        self.handlers: List[Tuple[Type[BaseException], RouteHandler]] = []
         self.cached_handlers: Dict[
             Tuple[Type[BaseException], Optional[str]], Optional[RouteHandler]
         ] = {}
         self.debug = False
-        self.fallback = fallback
         self.base = base
 
     @classmethod
-    def finalize(cls, error_handler):
-        if not isinstance(error_handler, cls):
-            error_logger.warning(
-                f"Error handler is non-conforming: {type(error_handler)}"
-            )
-
-        sig = signature(error_handler.lookup)
-        if len(sig.parameters) == 1:
-            error_logger.warning(
-                DeprecationWarning(
-                    "You are using a deprecated error handler. The lookup "
-                    "method should accept two positional parameters: "
-                    "(exception, route_name: Optional[str]). "
-                    "Until you upgrade your ErrorHandler.lookup, Blueprint "
-                    "specific exceptions will not work properly. Beginning "
-                    "in v22.3, the legacy style lookup method will not "
-                    "work at all."
-                ),
-            )
-            error_handler._lookup = error_handler._legacy_lookup
+    def finalize(cls, *args, **kwargs):
+        deprecation(
+            "ErrorHandler.finalize is deprecated and no longer needed. "
+            "Please remove update your code to remove it. ",
+            22.12,
+        )
 
     def _full_lookup(self, exception, route_name: Optional[str] = None):
         return self.lookup(exception, route_name)
-
-    def _legacy_lookup(self, exception, route_name: Optional[str] = None):
-        return self.lookup(exception)
 
     def add(self, exception, handler, route_names: Optional[List[str]] = None):
         """
@@ -78,9 +60,6 @@ class ErrorHandler:
 
         :return: None
         """
-        # self.handlers is deprecated and will be removed in version 22.3
-        self.handlers.append((exception, handler))
-
         if route_names:
             for route in route_names:
                 self.cached_handlers[(exception, route)] = handler
@@ -152,7 +131,7 @@ class ErrorHandler:
         except Exception:
             try:
                 url = repr(request.url)
-            except AttributeError:
+            except AttributeError:  # no cov
                 url = "unknown"
             response_message = (
                 "Exception raised in exception handler " '"%s" for uri: %s'
@@ -181,12 +160,13 @@ class ErrorHandler:
         :return:
         """
         self.log(request, exception)
+        fallback = request.app.config.FALLBACK_ERROR_FORMAT
         return exception_response(
             request,
             exception,
             debug=self.debug,
             base=self.base,
-            fallback=self.fallback,
+            fallback=fallback,
         )
 
     @staticmethod
@@ -196,7 +176,7 @@ class ErrorHandler:
         if quiet is False or noisy is True:
             try:
                 url = repr(request.url)
-            except AttributeError:
+            except AttributeError:  # no cov
                 url = "unknown"
 
             error_logger.exception(
@@ -239,18 +219,18 @@ class ContentRangeHandler:
         try:
             self.start = int(start_b) if start_b else None
         except ValueError:
-            raise ContentRangeError(
+            raise RangeNotSatisfiable(
                 "'%s' is invalid for Content Range" % (start_b,), self
             )
         try:
             self.end = int(end_b) if end_b else None
         except ValueError:
-            raise ContentRangeError(
+            raise RangeNotSatisfiable(
                 "'%s' is invalid for Content Range" % (end_b,), self
             )
         if self.end is None:
             if self.start is None:
-                raise ContentRangeError(
+                raise RangeNotSatisfiable(
                     "Invalid for Content Range parameters", self
                 )
             else:
@@ -262,7 +242,7 @@ class ContentRangeHandler:
                 self.start = self.total - self.end
                 self.end = self.total - 1
         if self.start >= self.end:
-            raise ContentRangeError(
+            raise RangeNotSatisfiable(
                 "Invalid for Content Range parameters", self
             )
         self.size = self.end - self.start + 1

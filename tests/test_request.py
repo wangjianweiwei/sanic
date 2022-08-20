@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from sanic import Sanic, response
+from sanic.exceptions import BadURL, SanicException
 from sanic.request import Request, uuid
 from sanic.server import HttpProtocol
 
@@ -176,3 +177,120 @@ def test_request_accept():
         "text/x-dvi; q=0.8",
         "text/plain; q=0.5",
     ]
+
+
+def test_bad_url_parse():
+    message = "Bad URL: my.redacted-domain.com:443"
+    with pytest.raises(BadURL, match=message):
+        Request(
+            b"my.redacted-domain.com:443",
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+        )
+
+
+def test_request_scope_raises_exception_when_no_asgi():
+    app = Sanic("no_asgi")
+
+    @app.get("/")
+    async def get(request):
+        return request.scope
+
+    request, response = app.test_client.get("/")
+    assert response.status == 500
+    with pytest.raises(NotImplementedError):
+        _ = request.scope
+
+
+@pytest.mark.asyncio
+async def test_request_scope_is_not_none_when_running_in_asgi(app):
+    @app.get("/")
+    async def get(request):
+        return response.empty()
+
+    request, _ = await app.asgi_client.get("/")
+
+    assert request.scope is not None
+    assert request.scope["method"].lower() == "get"
+    assert request.scope["path"].lower() == "/"
+
+
+def test_cannot_get_request_outside_of_cycle():
+    with pytest.raises(SanicException, match="No current request"):
+        Request.get_current()
+
+
+def test_get_current_request(app):
+    @app.get("/")
+    async def get(request):
+        return response.json({"same": request is Request.get_current()})
+
+    _, resp = app.test_client.get("/")
+    assert resp.json["same"]
+
+
+def test_request_stream_id(app):
+    @app.get("/")
+    async def get(request):
+        try:
+            request.stream_id
+        except Exception as e:
+            return response.text(str(e))
+
+    _, resp = app.test_client.get("/")
+    assert resp.text == "Stream ID is only a property of a HTTP/3 request"
+
+
+@pytest.mark.parametrize(
+    "method,safe",
+    (
+        ("DELETE", False),
+        ("GET", True),
+        ("HEAD", True),
+        ("OPTIONS", True),
+        ("PATCH", False),
+        ("POST", False),
+        ("PUT", False),
+    ),
+)
+def test_request_safe(method, safe):
+    request = Request(b"/", {}, None, method, None, None)
+    assert request.is_safe is safe
+
+
+@pytest.mark.parametrize(
+    "method,idempotent",
+    (
+        ("DELETE", True),
+        ("GET", True),
+        ("HEAD", True),
+        ("OPTIONS", True),
+        ("PATCH", False),
+        ("POST", False),
+        ("PUT", True),
+    ),
+)
+def test_request_idempotent(method, idempotent):
+    request = Request(b"/", {}, None, method, None, None)
+    assert request.is_idempotent is idempotent
+
+
+@pytest.mark.parametrize(
+    "method,cacheable",
+    (
+        ("DELETE", False),
+        ("GET", True),
+        ("HEAD", True),
+        ("OPTIONS", False),
+        ("PATCH", False),
+        ("POST", False),
+        ("PUT", False),
+    ),
+)
+def test_request_cacheable(method, cacheable):
+    request = Request(b"/", {}, None, method, None, None)
+    assert request.is_cacheable is cacheable

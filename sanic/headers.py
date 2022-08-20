@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 from urllib.parse import unquote
 
 from sanic.exceptions import InvalidHeader
@@ -18,7 +18,7 @@ Options = Dict[str, Union[int, str]]  # key=value fields in various headers
 OptionsIterable = Iterable[Tuple[str, str]]  # May contain duplicate keys
 
 _token, _quoted = r"([\w!#$%&'*+\-.^_`|~]+)", r'"([^"]*)"'
-_param = re.compile(fr";\s*{_token}=(?:{_token}|{_quoted})", re.ASCII)
+_param = re.compile(rf";\s*{_token}=(?:{_token}|{_quoted})", re.ASCII)
 _firefox_quote_escape = re.compile(r'\\"(?!; |\s*$)')
 _ipv6 = "(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}"
 _ipv6_re = re.compile(_ipv6)
@@ -28,7 +28,7 @@ _host_re = re.compile(
 
 # RFC's quoted-pair escapes are mostly ignored by browsers. Chrome, Firefox and
 # curl all have different escaping, that we try to handle as well as possible,
-# even though no client espaces in a way that would allow perfect handling.
+# even though no client escapes in a way that would allow perfect handling.
 
 # For more information, consult ../tests/test_requests.py
 
@@ -394,3 +394,17 @@ def parse_accept(accept: str) -> AcceptContainer:
     return AcceptContainer(
         sorted(accept_list, key=_sort_accept_value, reverse=True)
     )
+
+
+def parse_credentials(
+    header: Optional[str],
+    prefixes: Union[List, Tuple, Set] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Parses any header with the aim to retrieve any credentials from it."""
+    if not prefixes or not isinstance(prefixes, (list, tuple, set)):
+        prefixes = ("Basic", "Bearer", "Token")
+    if header is not None:
+        for prefix in prefixes:
+            if prefix in header:
+                return prefix, header.partition(prefix)[-1].strip()
+    return None, header

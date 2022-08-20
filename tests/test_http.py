@@ -1,9 +1,8 @@
-import asyncio
 import json as stdjson
 
 from collections import namedtuple
-from textwrap import dedent
-from typing import AnyStr
+from pathlib import Path
+from sys import version_info
 
 import pytest
 
@@ -11,52 +10,13 @@ from sanic_testing.reusable import ReusableClient
 
 from sanic import json, text
 from sanic.app import Sanic
+from tests.client import RawClient
 
+
+parent_dir = Path(__file__).parent
+localhost_dir = parent_dir / "certs/localhost"
 
 PORT = 1234
-
-
-class RawClient:
-    CRLF = b"\r\n"
-
-    def __init__(self, host: str, port: int):
-        self.reader = None
-        self.writer = None
-        self.host = host
-        self.port = port
-
-    async def connect(self):
-        self.reader, self.writer = await asyncio.open_connection(
-            self.host, self.port
-        )
-
-    async def close(self):
-        self.writer.close()
-        await self.writer.wait_closed()
-
-    async def send(self, message: AnyStr):
-        if isinstance(message, str):
-            msg = self._clean(message).encode("utf-8")
-        else:
-            msg = message
-        await self._send(msg)
-
-    async def _send(self, message: bytes):
-        if not self.writer:
-            raise Exception("No open write stream")
-        self.writer.write(message)
-
-    async def recv(self, nbytes: int = -1) -> bytes:
-        if not self.reader:
-            raise Exception("No open read stream")
-        return await self.reader.read(nbytes)
-
-    def _clean(self, message: str) -> str:
-        return (
-            dedent(message)
-            .lstrip("\n")
-            .replace("\n", self.CRLF.decode("utf-8"))
-        )
 
 
 @pytest.fixture
@@ -76,7 +36,7 @@ def test_app(app: Sanic):
 
 
 @pytest.fixture
-def runner(test_app):
+def runner(test_app: Sanic):
     client = ReusableClient(test_app, port=PORT)
     client.run()
     yield client
@@ -84,7 +44,7 @@ def runner(test_app):
 
 
 @pytest.fixture
-def client(runner):
+def client(runner: ReusableClient):
     client = namedtuple("Client", ("raw", "send", "recv"))
 
     raw = RawClient(runner.host, runner.port)
@@ -115,7 +75,10 @@ def test_full_message(client):
         """
     )
     response = client.recv()
-    assert len(response) == 140
+
+    # AltSvcCheck touchup removes the Alt-Svc header from the
+    # response in the Python 3.9+ in this case
+    assert len(response) == (151 if version_info < (3, 9) else 140)
     assert b"200 OK" in response
 
 

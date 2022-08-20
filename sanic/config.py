@@ -1,61 +1,88 @@
-from inspect import isclass
+from __future__ import annotations
+
+from inspect import getmembers, isclass, isdatadescriptor
 from os import environ
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
-from warnings import warn
+from typing import Any, Callable, Dict, Optional, Sequence, Union
 
-from sanic.errorpages import check_error_format
+from sanic.constants import LocalCertCreator
+from sanic.errorpages import DEFAULT_FORMAT, check_error_format
+from sanic.helpers import Default, _default
 from sanic.http import Http
-
-from .utils import load_module_from_file_location, str_to_bool
+from sanic.log import deprecation, error_logger
+from sanic.utils import load_module_from_file_location, str_to_bool
 
 
 SANIC_PREFIX = "SANIC_"
-BASE_LOGO = """
 
-                 Sanic
-         Build Fast. Run Fast.
-
-"""
 
 DEFAULT_CONFIG = {
+    "_FALLBACK_ERROR_FORMAT": _default,
     "ACCESS_LOG": True,
+    "AUTO_EXTEND": True,
+    "AUTO_RELOAD": False,
     "EVENT_AUTOREGISTER": False,
-    "FALLBACK_ERROR_FORMAT": "auto",
     "FORWARDED_FOR_HEADER": "X-Forwarded-For",
     "FORWARDED_SECRET": None,
     "GRACEFUL_SHUTDOWN_TIMEOUT": 15.0,  # 15 sec
     "KEEP_ALIVE_TIMEOUT": 5,  # 5 seconds
     "KEEP_ALIVE": True,
+    "LOCAL_CERT_CREATOR": LocalCertCreator.AUTO,
+    "LOCAL_TLS_KEY": _default,
+    "LOCAL_TLS_CERT": _default,
+    "LOCALHOST": "localhost",
+    "MOTD": True,
+    "MOTD_DISPLAY": {},
     "NOISY_EXCEPTIONS": False,
     "PROXIES_COUNT": None,
     "REAL_IP_HEADER": None,
-    "REGISTER": True,
     "REQUEST_BUFFER_SIZE": 65536,  # 64 KiB
     "REQUEST_MAX_HEADER_SIZE": 8192,  # 8 KiB, but cannot exceed 16384
     "REQUEST_ID_HEADER": "X-Request-ID",
     "REQUEST_MAX_SIZE": 100000000,  # 100 megabytes
     "REQUEST_TIMEOUT": 60,  # 60 seconds
     "RESPONSE_TIMEOUT": 60,  # 60 seconds
-    "WEBSOCKET_MAX_SIZE": 2 ** 20,  # 1 megabyte
+    "TLS_CERT_PASSWORD": "",
+    "TOUCHUP": _default,
+    "USE_UVLOOP": _default,
+    "WEBSOCKET_MAX_SIZE": 2**20,  # 1 megabyte
     "WEBSOCKET_PING_INTERVAL": 20,
     "WEBSOCKET_PING_TIMEOUT": 20,
 }
 
+# These values will be removed from the Config object in v22.6 and moved
+# to the application state
+DEPRECATED_CONFIG = ("SERVER_RUNNING", "RELOADER_PROCESS", "RELOADED_FILES")
 
-class Config(dict):
+
+class DescriptorMeta(type):
+    def __init__(cls, *_):
+        cls.__setters__ = {name for name, _ in getmembers(cls, cls._is_setter)}
+
+    @staticmethod
+    def _is_setter(member: object):
+        return isdatadescriptor(member) and hasattr(member, "setter")
+
+
+class Config(dict, metaclass=DescriptorMeta):
     ACCESS_LOG: bool
+    AUTO_EXTEND: bool
+    AUTO_RELOAD: bool
     EVENT_AUTOREGISTER: bool
-    FALLBACK_ERROR_FORMAT: str
     FORWARDED_FOR_HEADER: str
     FORWARDED_SECRET: Optional[str]
     GRACEFUL_SHUTDOWN_TIMEOUT: float
     KEEP_ALIVE_TIMEOUT: int
     KEEP_ALIVE: bool
+    LOCAL_CERT_CREATOR: Union[str, LocalCertCreator]
+    LOCAL_TLS_KEY: Union[Path, str, Default]
+    LOCAL_TLS_CERT: Union[Path, str, Default]
+    LOCALHOST: str
+    MOTD: bool
+    MOTD_DISPLAY: Dict[str, str]
     NOISY_EXCEPTIONS: bool
     PROXIES_COUNT: Optional[int]
     REAL_IP_HEADER: Optional[str]
-    REGISTER: bool
     REQUEST_BUFFER_SIZE: int
     REQUEST_MAX_HEADER_SIZE: int
     REQUEST_ID_HEADER: str
@@ -63,6 +90,9 @@ class Config(dict):
     REQUEST_TIMEOUT: int
     RESPONSE_TIMEOUT: int
     SERVER_NAME: str
+    TLS_CERT_PASSWORD: str
+    TOUCHUP: Union[Default, bool]
+    USE_UVLOOP: Union[Default, bool]
     WEBSOCKET_MAX_SIZE: int
     WEBSOCKET_PING_INTERVAL: int
     WEBSOCKET_PING_TIMEOUT: int
@@ -70,14 +100,19 @@ class Config(dict):
     def __init__(
         self,
         defaults: Dict[str, Union[str, bool, int, float, None]] = None,
-        load_env: Optional[Union[bool, str]] = True,
         env_prefix: Optional[str] = SANIC_PREFIX,
         keep_alive: Optional[bool] = None,
+        *,
+        converters: Optional[Sequence[Callable[[str], Any]]] = None,
     ):
         defaults = defaults or {}
         super().__init__({**DEFAULT_CONFIG, **defaults})
 
-        self.LOGO = BASE_LOGO
+        self._converters = [str, str_to_bool, float, int]
+
+        if converters:
+            for converter in converters:
+                self.register_type(converter)
 
         if keep_alive is not None:
             self.KEEP_ALIVE = keep_alive
@@ -85,37 +120,77 @@ class Config(dict):
         if env_prefix != SANIC_PREFIX:
             if env_prefix:
                 self.load_environment_vars(env_prefix)
-        elif load_env is not True:
-            if load_env:
-                self.load_environment_vars(prefix=load_env)
-            warn(
-                "Use of load_env is deprecated and will be removed in "
-                "21.12. Modify the configuration prefix by passing "
-                "env_prefix instead.",
-                DeprecationWarning,
-            )
         else:
             self.load_environment_vars(SANIC_PREFIX)
 
         self._configure_header_size()
         self._check_error_format()
+        self._init = True
 
-    def __getattr__(self, attr):
+    def __getattr__(self, attr: Any):
         try:
             return self[attr]
         except KeyError as ke:
             raise AttributeError(f"Config has no '{ke.args[0]}'")
 
-    def __setattr__(self, attr, value):
-        self[attr] = value
-        if attr in (
-            "REQUEST_MAX_HEADER_SIZE",
-            "REQUEST_BUFFER_SIZE",
-            "REQUEST_MAX_SIZE",
+    def __setattr__(self, attr: str, value: Any) -> None:
+        self.update({attr: value})
+
+    def __setitem__(self, attr: str, value: Any) -> None:
+        self.update({attr: value})
+
+    def update(self, *other: Any, **kwargs: Any) -> None:
+        kwargs.update({k: v for item in other for k, v in dict(item).items()})
+        setters: Dict[str, Any] = {
+            k: kwargs.pop(k)
+            for k in {**kwargs}.keys()
+            if k in self.__class__.__setters__
+        }
+
+        for key, value in setters.items():
+            try:
+                super().__setattr__(key, value)
+            except AttributeError:
+                ...
+
+        super().update(**kwargs)
+        for attr, value in {**setters, **kwargs}.items():
+            self._post_set(attr, value)
+
+    def _post_set(self, attr, value) -> None:
+        if self.get("_init"):
+            if attr in (
+                "REQUEST_MAX_HEADER_SIZE",
+                "REQUEST_BUFFER_SIZE",
+                "REQUEST_MAX_SIZE",
+            ):
+                self._configure_header_size()
+
+        if attr == "LOCAL_CERT_CREATOR" and not isinstance(
+            self.LOCAL_CERT_CREATOR, LocalCertCreator
         ):
-            self._configure_header_size()
-        elif attr == "FALLBACK_ERROR_FORMAT":
-            self._check_error_format()
+            self.LOCAL_CERT_CREATOR = LocalCertCreator[
+                self.LOCAL_CERT_CREATOR.upper()
+            ]
+
+    @property
+    def FALLBACK_ERROR_FORMAT(self) -> str:
+        if self._FALLBACK_ERROR_FORMAT is _default:
+            return DEFAULT_FORMAT
+        return self._FALLBACK_ERROR_FORMAT
+
+    @FALLBACK_ERROR_FORMAT.setter
+    def FALLBACK_ERROR_FORMAT(self, value):
+        self._check_error_format(value)
+        if (
+            self._FALLBACK_ERROR_FORMAT is not _default
+            and value != self._FALLBACK_ERROR_FORMAT
+        ):
+            error_logger.warning(
+                "Setting config.FALLBACK_ERROR_FORMAT on an already "
+                "configured value may have unintended consequences."
+            )
+        self._FALLBACK_ERROR_FORMAT = value
 
     def _configure_header_size(self):
         Http.set_header_max_size(
@@ -124,36 +199,60 @@ class Config(dict):
             self.REQUEST_MAX_SIZE,
         )
 
-    def _check_error_format(self):
-        check_error_format(self.FALLBACK_ERROR_FORMAT)
+    def _check_error_format(self, format: Optional[str] = None):
+        check_error_format(format or self.FALLBACK_ERROR_FORMAT)
 
     def load_environment_vars(self, prefix=SANIC_PREFIX):
         """
-        Looks for prefixed environment variables and applies
-        them to the configuration if present. This is called automatically when
-        Sanic starts up to load environment variables into config.
+        Looks for prefixed environment variables and applies them to the
+        configuration if present. This is called automatically when Sanic
+        starts up to load environment variables into config.
 
-        It will automatically hyrdate the following types:
+        It will automatically hydrate the following types:
 
         - ``int``
         - ``float``
         - ``bool``
 
-        Anything else will be imported as a ``str``.
+        Anything else will be imported as a ``str``. If you would like to add
+        additional types to this list, you can use
+        :meth:`sanic.config.Config.register_type`. Just make sure that they
+        are registered before you instantiate your application.
+
+        .. code-block:: python
+
+            class Foo:
+                def __init__(self, name) -> None:
+                    self.name = name
+
+
+            config = Config(converters=[Foo])
+            app = Sanic(__name__, config=config)
+
+        `See user guide re: config
+        <https://sanicframework.org/guide/deployment/configuration.html>`__
         """
-        for k, v in environ.items():
-            if k.startswith(prefix):
-                _, config_key = k.split(prefix, 1)
+        lower_case_var_found = False
+        for key, value in environ.items():
+            if not key.startswith(prefix):
+                continue
+            if not key.isupper():
+                lower_case_var_found = True
+
+            _, config_key = key.split(prefix, 1)
+
+            for converter in reversed(self._converters):
                 try:
-                    self[config_key] = int(v)
+                    self[config_key] = converter(value)
+                    break
                 except ValueError:
-                    try:
-                        self[config_key] = float(v)
-                    except ValueError:
-                        try:
-                            self[config_key] = str_to_bool(v)
-                        except ValueError:
-                            self[config_key] = v
+                    pass
+        if lower_case_var_found:
+            deprecation(
+                "Lowercase environment variables will not be "
+                "loaded into Sanic config beginning in v22.9.",
+                22.9,
+            )
 
     def update_config(self, config: Union[bytes, str, dict, Any]):
         """
@@ -223,3 +322,17 @@ class Config(dict):
         self.update(config)
 
     load = update_config
+
+    def register_type(self, converter: Callable[[str], Any]) -> None:
+        """
+        Allows for adding custom function to cast from a string value to any
+        other type. The function should raise ValueError if it is not the
+        correct type.
+        """
+        if converter in self._converters:
+            error_logger.warning(
+                f"Configuration value converter '{converter.__name__}' has "
+                "already been registered"
+            )
+            return
+        self._converters.append(converter)

@@ -7,15 +7,9 @@ import pytest
 from sanic.app import Sanic
 from sanic.blueprints import Blueprint
 from sanic.constants import HTTP_METHODS
-from sanic.exceptions import (
-    InvalidUsage,
-    NotFound,
-    SanicException,
-    ServerError,
-)
+from sanic.exceptions import BadRequest, NotFound, SanicException, ServerError
 from sanic.request import Request
 from sanic.response import json, text
-from sanic.views import CompositionView
 
 
 # ------------------------------------------------------------ #
@@ -449,7 +443,7 @@ def test_bp_exception_handler(app):
 
     @blueprint.route("/1")
     def handler_1(request):
-        raise InvalidUsage("OK")
+        raise BadRequest("OK")
 
     @blueprint.route("/2")
     def handler_2(request):
@@ -833,7 +827,7 @@ def test_static_blueprint_name(static_file_directory, file_name):
 
 @pytest.mark.parametrize("file_name", ["test.file"])
 def test_static_blueprintp_mw(app: Sanic, static_file_directory, file_name):
-    current_file = inspect.getfile(inspect.currentframe())
+    current_file = inspect.getfile(inspect.currentframe())  # type: ignore
     with open(current_file, "rb") as file:
         file.read()
 
@@ -860,31 +854,6 @@ def test_static_blueprintp_mw(app: Sanic, static_file_directory, file_name):
 
     _, response = app.test_client.get("/test.file")
     assert triggered is True
-
-
-def test_route_handler_add(app: Sanic):
-    view = CompositionView()
-
-    async def get_handler(request):
-        return json({"response": "OK"})
-
-    view.add(["GET"], get_handler, stream=False)
-
-    async def default_handler(request):
-        return text("OK")
-
-    bp = Blueprint(name="handler", url_prefix="/handler")
-    bp.add_route(default_handler, uri="/default/", strict_slashes=True)
-
-    bp.add_route(view, uri="/view", name="test")
-
-    app.blueprint(bp)
-
-    _, response = app.test_client.get("/handler/default/")
-    assert response.text == "OK"
-
-    _, response = app.test_client.get("/handler/view")
-    assert response.json["response"] == "OK"
 
 
 def test_websocket_route(app: Sanic):
@@ -1079,12 +1048,37 @@ def test_blueprint_registered_multiple_apps():
 
 def test_bp_set_attribute_warning():
     bp = Blueprint("bp")
-    with pytest.warns(DeprecationWarning) as record:
+    message = (
+        "Setting variables on Blueprint instances is not allowed. You should "
+        "change your Blueprint instance to use instance.ctx.foo instead."
+    )
+    with pytest.raises(AttributeError, match=message):
         bp.foo = 1
 
-    assert len(record) == 1
-    assert record[0].message.args[0] == (
-        "Setting variables on Blueprint instances is deprecated "
-        "and will be removed in version 21.12. You should change your "
-        "Blueprint instance to use instance.ctx.foo instead."
-    )
+
+def test_early_registration(app):
+    assert len(app.router.routes) == 0
+
+    bp = Blueprint("bp")
+
+    @bp.get("/one")
+    async def one(_):
+        return text("one")
+
+    app.blueprint(bp)
+
+    assert len(app.router.routes) == 1
+
+    @bp.get("/two")
+    async def two(_):
+        return text("two")
+
+    @bp.get("/three")
+    async def three(_):
+        return text("three")
+
+    assert len(app.router.routes) == 3
+
+    for path in ("one", "two", "three"):
+        _, response = app.test_client.get(f"/{path}")
+        assert response.text == path

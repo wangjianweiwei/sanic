@@ -17,7 +17,7 @@ def test_custom_context(app):
 
     @app.route("/")
     def handler(request):
-        # Accessing non-existant key should fail with AttributeError
+        # Accessing non-existent key should fail with AttributeError
         try:
             invalid = request.ctx.missing
         except AttributeError as e:
@@ -68,11 +68,11 @@ def test_app_injection(app):
 
     @app.listener("after_server_start")
     async def inject_data(app, loop):
-        app.injected = expected
+        app.ctx.injected = expected
 
     @app.get("/")
     async def handler(request):
-        return json({"injected": request.app.injected})
+        return json({"injected": request.app.ctx.injected})
 
     request, response = app.test_client.get("/")
 

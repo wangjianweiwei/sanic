@@ -1,6 +1,7 @@
 import inspect
 import logging
 import os
+import sys
 
 from collections import Counter
 from pathlib import Path
@@ -8,7 +9,7 @@ from time import gmtime, strftime
 
 import pytest
 
-from sanic import text
+from sanic import Sanic, text
 from sanic.exceptions import FileNotFound
 
 
@@ -19,6 +20,22 @@ def static_file_directory():
     current_directory = os.path.dirname(os.path.abspath(current_file))
     static_directory = os.path.join(current_directory, "static")
     return static_directory
+
+
+@pytest.fixture(scope="module")
+def double_dotted_directory_file(static_file_directory: str):
+    """Generate double dotted directory and its files"""
+    if sys.platform == "win32":
+        raise Exception("Windows doesn't support double dotted directories")
+
+    file_path = Path(static_file_directory) / "dotted.." / "dot.txt"
+    double_dotted_dir = file_path.parent
+    Path.mkdir(double_dotted_dir, exist_ok=True)
+    with open(file_path, "w") as f:
+        f.write("DOT\n")
+    yield file_path
+    Path.unlink(file_path)
+    Path.rmdir(double_dotted_dir)
 
 
 def get_file_path(static_file_directory, file_name):
@@ -483,11 +500,12 @@ def test_stack_trace_on_not_found(app, static_file_directory, caplog):
     with caplog.at_level(logging.INFO):
         _, response = app.test_client.get("/static/non_existing_file.file")
 
-    counter = Counter([r[1] for r in caplog.record_tuples])
+    counter = Counter([(r[0], r[1]) for r in caplog.record_tuples])
 
     assert response.status == 404
-    assert counter[logging.INFO] == 5
-    assert counter[logging.ERROR] == 0
+    assert counter[("sanic.root", logging.INFO)] == 11
+    assert counter[("sanic.root", logging.ERROR)] == 0
+    assert counter[("sanic.error", logging.ERROR)] == 0
 
 
 def test_no_stack_trace_on_not_found(app, static_file_directory, caplog):
@@ -500,11 +518,12 @@ def test_no_stack_trace_on_not_found(app, static_file_directory, caplog):
     with caplog.at_level(logging.INFO):
         _, response = app.test_client.get("/static/non_existing_file.file")
 
-    counter = Counter([r[1] for r in caplog.record_tuples])
+    counter = Counter([(r[0], r[1]) for r in caplog.record_tuples])
 
     assert response.status == 404
-    assert counter[logging.INFO] == 5
-    assert logging.ERROR not in counter
+    assert counter[("sanic.root", logging.INFO)] == 11
+    assert counter[("sanic.root", logging.ERROR)] == 0
+    assert counter[("sanic.error", logging.ERROR)] == 0
     assert response.text == "No file: /static/non_existing_file.file"
 
 
@@ -576,3 +595,43 @@ def test_resource_type_dir(app, static_file_directory):
 def test_resource_type_unknown(app, static_file_directory, caplog):
     with pytest.raises(ValueError):
         app.static("/static", static_file_directory, resource_type="unknown")
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows does not support double dotted directories",
+)
+def test_dotted_dir_ok(
+    app: Sanic, static_file_directory: str, double_dotted_directory_file: Path
+):
+    app.static("/foo", static_file_directory)
+    dot_relative_path = str(
+        double_dotted_directory_file.relative_to(static_file_directory)
+    )
+    _, response = app.test_client.get("/foo/" + dot_relative_path)
+    assert response.status == 200
+    assert response.body == b"DOT\n"
+
+
+def test_breakout(app: Sanic, static_file_directory: str):
+    app.static("/foo", static_file_directory)
+
+    _, response = app.test_client.get("/foo/..%2Ffake/server.py")
+    assert response.status == 404
+
+    _, response = app.test_client.get("/foo/..%2Fstatic/test.file")
+    assert response.status == 404
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Block backslash on Windows only"
+)
+def test_double_backslash_prohibited_on_win32(
+    app: Sanic, static_file_directory: str
+):
+    app.static("/foo", static_file_directory)
+
+    _, response = app.test_client.get("/foo/static/..\\static/test.file")
+    assert response.status == 404
+    _, response = app.test_client.get("/foo/static\\../static/test.file")
+    assert response.status == 404

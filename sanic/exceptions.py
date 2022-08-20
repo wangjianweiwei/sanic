@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from sanic.helpers import STATUS_CODES
 
@@ -11,7 +11,11 @@ class SanicException(Exception):
         message: Optional[Union[str, bytes]] = None,
         status_code: Optional[int] = None,
         quiet: Optional[bool] = None,
+        context: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
+        self.context = context
+        self.extra = extra
         if message is None:
             if self.message:
                 message = self.message
@@ -38,7 +42,7 @@ class NotFound(SanicException):
     quiet = True
 
 
-class InvalidUsage(SanicException):
+class BadRequest(SanicException):
     """
     **Status**: 400 Bad Request
     """
@@ -47,7 +51,14 @@ class InvalidUsage(SanicException):
     quiet = True
 
 
-class MethodNotSupported(SanicException):
+InvalidUsage = BadRequest
+
+
+class BadURL(BadRequest):
+    ...
+
+
+class MethodNotAllowed(SanicException):
     """
     **Status**: 405 Method Not Allowed
     """
@@ -58,6 +69,9 @@ class MethodNotSupported(SanicException):
     def __init__(self, message, method, allowed_methods):
         super().__init__(message)
         self.headers = {"Allow": ", ".join(allowed_methods)}
+
+
+MethodNotSupported = MethodNotAllowed
 
 
 class ServerError(SanicException):
@@ -121,19 +135,19 @@ class PayloadTooLarge(SanicException):
     quiet = True
 
 
-class HeaderNotFound(InvalidUsage):
+class HeaderNotFound(BadRequest):
     """
     **Status**: 400 Bad Request
     """
 
 
-class InvalidHeader(InvalidUsage):
+class InvalidHeader(BadRequest):
     """
     **Status**: 400 Bad Request
     """
 
 
-class ContentRangeError(SanicException):
+class RangeNotSatisfiable(SanicException):
     """
     **Status**: 416 Range Not Satisfiable
     """
@@ -146,13 +160,19 @@ class ContentRangeError(SanicException):
         self.headers = {"Content-Range": f"bytes */{content_range.total}"}
 
 
-class HeaderExpectationFailed(SanicException):
+ContentRangeError = RangeNotSatisfiable
+
+
+class ExpectationFailed(SanicException):
     """
     **Status**: 417 Expectation Failed
     """
 
     status_code = 417
     quiet = True
+
+
+HeaderExpectationFailed = ExpectationFailed
 
 
 class Forbidden(SanicException):
@@ -164,7 +184,7 @@ class Forbidden(SanicException):
     quiet = True
 
 
-class InvalidRangeType(ContentRangeError):
+class InvalidRangeType(RangeNotSatisfiable):
     """
     **Status**: 416 Range Not Satisfiable
     """
@@ -240,25 +260,3 @@ class InvalidSignal(SanicException):
 class WebsocketClosed(SanicException):
     quiet = True
     message = "Client has closed the websocket connection"
-
-
-def abort(status_code: int, message: Optional[Union[str, bytes]] = None):
-    """
-    Raise an exception based on SanicException. Returns the HTTP response
-    message appropriate for the given status code, unless provided.
-
-    STATUS_CODES from sanic.helpers for the given status code.
-
-    :param status_code: The HTTP status code to return.
-    :param message: The HTTP response body. Defaults to the messages in
-    """
-    import warnings
-
-    warnings.warn(
-        "sanic.exceptions.abort has been marked as deprecated, and will be "
-        "removed in release 21.12.\n To migrate your code, simply replace "
-        "abort(status_code, msg) with raise SanicException(msg, status_code), "
-        "or even better, raise an appropriate SanicException subclass."
-    )
-
-    raise SanicException(message=message, status_code=status_code)

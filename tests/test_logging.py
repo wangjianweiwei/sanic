@@ -136,7 +136,7 @@ def test_log_connection_lost(app, debug, monkeypatch):
 async def test_logger(caplog):
     rand_string = str(uuid.uuid4())
 
-    app = Sanic(name=__name__)
+    app = Sanic(name="Test")
 
     @app.get("/")
     def log_info(request):
@@ -163,7 +163,7 @@ def test_logging_modified_root_logger_config():
 
 def test_access_log_client_ip_remote_addr(monkeypatch):
     access = Mock()
-    monkeypatch.setattr(sanic.http, "access_logger", access)
+    monkeypatch.setattr(sanic.http.http1, "access_logger", access)
 
     app = Sanic("test_logging")
     app.config.PROXIES_COUNT = 2
@@ -190,7 +190,7 @@ def test_access_log_client_ip_remote_addr(monkeypatch):
 
 def test_access_log_client_ip_reqip(monkeypatch):
     access = Mock()
-    monkeypatch.setattr(sanic.http, "access_logger", access)
+    monkeypatch.setattr(sanic.http.http1, "access_logger", access)
 
     app = Sanic("test_logging")
 
@@ -209,3 +209,42 @@ def test_access_log_client_ip_reqip(monkeypatch):
             "request": f"GET {request.scheme}://{request.host}/",
         },
     )
+
+
+@pytest.mark.parametrize(
+    "app_verbosity,log_verbosity,exists",
+    (
+        (0, 0, True),
+        (0, 1, False),
+        (0, 2, False),
+        (1, 0, True),
+        (1, 1, True),
+        (1, 2, False),
+        (2, 0, True),
+        (2, 1, True),
+        (2, 2, True),
+    ),
+)
+def test_verbosity(app, caplog, app_verbosity, log_verbosity, exists):
+    rand_string = str(uuid.uuid4())
+
+    @app.get("/")
+    def log_info(request):
+        logger.info("DEFAULT")
+        logger.info(rand_string, extra={"verbosity": log_verbosity})
+        return text("hello")
+
+    with caplog.at_level(logging.INFO):
+        _ = app.test_client.get(
+            "/", server_kwargs={"verbosity": app_verbosity}
+        )
+
+    record = ("sanic.root", logging.INFO, rand_string)
+
+    if exists:
+        assert record in caplog.record_tuples
+    else:
+        assert record not in caplog.record_tuples
+
+    if app_verbosity == 0:
+        assert ("sanic.root", logging.INFO, "DEFAULT") in caplog.record_tuples

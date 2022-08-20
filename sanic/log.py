@@ -1,8 +1,14 @@
 import logging
 import sys
 
+from enum import Enum
+from typing import Any, Dict
+from warnings import warn
 
-LOGGING_CONFIG_DEFAULTS = dict(
+from sanic.compat import is_atty
+
+
+LOGGING_CONFIG_DEFAULTS: Dict[str, Any] = dict(  # no cov
     version=1,
     disable_existing_loggers=False,
     loggers={
@@ -51,19 +57,53 @@ LOGGING_CONFIG_DEFAULTS = dict(
         },
     },
 )
+"""
+Defult logging configuration
+"""
 
 
-logger = logging.getLogger("sanic.root")
+class Colors(str, Enum):  # no cov
+    END = "\033[0m"
+    BLUE = "\033[01;34m"
+    GREEN = "\033[01;32m"
+    PURPLE = "\033[01;35m"
+    RED = "\033[01;31m"
+    SANIC = "\033[38;2;255;13;104m"
+    YELLOW = "\033[01;33m"
+
+
+class VerbosityFilter(logging.Filter):
+    verbosity: int = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        verbosity = getattr(record, "verbosity", 0)
+        return verbosity <= self.verbosity
+
+
+_verbosity_filter = VerbosityFilter()
+
+logger = logging.getLogger("sanic.root")  # no cov
 """
 General Sanic logger
 """
+logger.addFilter(_verbosity_filter)
 
-error_logger = logging.getLogger("sanic.error")
+error_logger = logging.getLogger("sanic.error")  # no cov
 """
 Logger used by Sanic for error logging
 """
+error_logger.addFilter(_verbosity_filter)
 
-access_logger = logging.getLogger("sanic.access")
+access_logger = logging.getLogger("sanic.access")  # no cov
 """
 Logger used by Sanic for access logging
 """
+access_logger.addFilter(_verbosity_filter)
+
+
+def deprecation(message: str, version: float):  # no cov
+    version_info = f"[DEPRECATION v{version}] "
+    if is_atty():
+        version_info = f"{Colors.RED}{version_info}"
+        message = f"{Colors.YELLOW}{message}{Colors.END}"
+    warn(version_info + message, DeprecationWarning)

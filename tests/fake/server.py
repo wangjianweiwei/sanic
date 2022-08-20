@@ -1,5 +1,4 @@
 import json
-import logging
 
 from sanic import Sanic, text
 from sanic.log import LOGGING_CONFIG_DEFAULTS, logger
@@ -9,7 +8,7 @@ LOGGING_CONFIG = {**LOGGING_CONFIG_DEFAULTS}
 LOGGING_CONFIG["formatters"]["generic"]["format"] = "%(message)s"
 LOGGING_CONFIG["loggers"]["sanic.root"]["level"] = "DEBUG"
 
-app = Sanic(__name__, log_config=LOGGING_CONFIG)
+app = Sanic("FakeServer", log_config=LOGGING_CONFIG)
 
 
 @app.get("/")
@@ -34,4 +33,13 @@ async def shutdown(app: Sanic, _):
 
 
 def create_app():
+    return app
+
+
+def create_app_with_args(args):
+    try:
+        print(f"foo={args.foo}")
+    except AttributeError:
+        print(f"module={args.module}")
+
     return app

@@ -1,8 +1,14 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from email.utils import formatdate, parsedate_to_datetime
 from functools import partial
 from mimetypes import guess_type
 from os import path
 from pathlib import PurePath
+from time import time
 from typing import (
+    TYPE_CHECKING,
     Any,
     AnyStr,
     Callable,
@@ -11,17 +17,32 @@ from typing import (
     Iterator,
     Optional,
     Tuple,
+    TypeVar,
     Union,
 )
 from urllib.parse import quote_plus
-from warnings import warn
 
-from sanic.compat import Header, open_async
+from sanic.compat import Header, open_async, stat_async
 from sanic.constants import DEFAULT_HTTP_CONTENT_TYPE
 from sanic.cookies import CookieJar
-from sanic.helpers import has_message_body, remove_entity_headers
+from sanic.exceptions import SanicException, ServerError
+from sanic.helpers import (
+    Default,
+    _default,
+    has_message_body,
+    remove_entity_headers,
+)
 from sanic.http import Http
+from sanic.log import logger
 from sanic.models.protocol_types import HTMLProtocol, Range
+
+
+if TYPE_CHECKING:
+    from sanic.asgi import ASGIApp
+    from sanic.http.http3 import HTTPReceiver
+    from sanic.request import Request
+else:
+    Request = TypeVar("Request")
 
 
 try:
@@ -39,16 +60,30 @@ class BaseHTTPResponse:
     The base class for all HTTP Responses
     """
 
+    __slots__ = (
+        "asgi",
+        "body",
+        "content_type",
+        "stream",
+        "status",
+        "headers",
+        "_cookies",
+    )
+
     _dumps = json_dumps
 
     def __init__(self):
         self.asgi: bool = False
         self.body: Optional[bytes] = None
         self.content_type: Optional[str] = None
-        self.stream: Http = None
+        self.stream: Optional[Union[Http, ASGIApp, HTTPReceiver]] = None
         self.status: int = None
         self.headers = Header({})
         self._cookies: Optional[CookieJar] = None
+
+    def __repr__(self):
+        class_name = self.__class__.__name__
+        return f"<{class_name}: {self.status} {self.content_type}>"
 
     def _encode_body(self, data: Optional[AnyStr]):
         if data is None:
@@ -101,7 +136,7 @@ class BaseHTTPResponse:
 
     async def send(
         self,
-        data: Optional[Union[AnyStr]] = None,
+        data: Optional[AnyStr] = None,
         end_stream: Optional[bool] = None,
     ) -> None:
         """
@@ -112,103 +147,26 @@ class BaseHTTPResponse:
         """
         if data is None and end_stream is None:
             end_stream = True
-        if end_stream and not data and self.stream.send is None:
-            return
+        if self.stream is None:
+            raise SanicException(
+                "No stream is connected to the response object instance."
+            )
+        if self.stream.send is None:
+            if end_stream and not data:
+                return
+            raise ServerError(
+                "Response stream was ended, no more response data is "
+                "allowed to be sent."
+            )
         data = (
             data.encode()  # type: ignore
             if hasattr(data, "encode")
             else data or b""
         )
-        await self.stream.send(data, end_stream=end_stream)
-
-
-StreamingFunction = Callable[[BaseHTTPResponse], Coroutine[Any, Any, None]]
-
-
-class StreamingHTTPResponse(BaseHTTPResponse):
-    """
-    Old style streaming response where you pass a streaming function:
-
-    .. code-block:: python
-
-        async def sample_streaming_fn(response):
-            await response.write("foo")
-            await asyncio.sleep(1)
-            await response.write("bar")
-            await asyncio.sleep(1)
-
-            @app.post("/")
-            async def test(request):
-                return stream(sample_streaming_fn)
-
-    .. warning::
-
-        **Deprecated** and set for removal in v21.12. You can now achieve the
-        same functionality without a callback.
-
-        .. code-block:: python
-
-            @app.post("/")
-            async def test(request):
-                response = await request.respond()
-                await response.send("foo", False)
-                await asyncio.sleep(1)
-                await response.send("bar", False)
-                await asyncio.sleep(1)
-                await response.send("", True)
-                return response
-
-    """
-
-    __slots__ = (
-        "streaming_fn",
-        "status",
-        "content_type",
-        "headers",
-        "_cookies",
-    )
-
-    def __init__(
-        self,
-        streaming_fn: StreamingFunction,
-        status: int = 200,
-        headers: Optional[Union[Header, Dict[str, str]]] = None,
-        content_type: str = "text/plain; charset=utf-8",
-        ignore_deprecation_notice: bool = False,
-    ):
-        if not ignore_deprecation_notice:
-            warn(
-                "Use of the StreamingHTTPResponse is deprecated in v21.6, and "
-                "will be removed in v21.12. Please upgrade your streaming "
-                "response implementation. You can learn more here: "
-                "https://sanicframework.org/en/guide/advanced/streaming.html"
-                "#response-streaming. If you use the builtin stream() or "
-                "file_stream() methods, this upgrade will be be done for you."
-            )
-
-        super().__init__()
-
-        self.content_type = content_type
-        self.streaming_fn = streaming_fn
-        self.status = status
-        self.headers = Header(headers or {})
-        self._cookies = None
-
-    async def write(self, data):
-        """Writes a chunk of data to the streaming response.
-
-        :param data: str or bytes-ish data to be written.
-        """
-        await super().send(self._encode_body(data))
-
-    async def send(self, *args, **kwargs):
-        if self.streaming_fn is not None:
-            await self.streaming_fn(self)
-            self.streaming_fn = None
-        await super().send(*args, **kwargs)
-
-    async def eof(self):
-        raise NotImplementedError
+        await self.stream.send(
+            data,  # type: ignore
+            end_stream=end_stream or False,
+        )
 
 
 class HTTPResponse(BaseHTTPResponse):
@@ -225,7 +183,7 @@ class HTTPResponse(BaseHTTPResponse):
     :type content_type: Optional[str]
     """
 
-    __slots__ = ("body", "status", "content_type", "headers", "_cookies")
+    __slots__ = ()
 
     def __init__(
         self,
@@ -253,7 +211,7 @@ class HTTPResponse(BaseHTTPResponse):
 
 
 def empty(
-    status=204, headers: Optional[Dict[str, str]] = None
+    status: int = 204, headers: Optional[Dict[str, str]] = None
 ) -> HTTPResponse:
     """
     Returns an empty response to the client.
@@ -270,7 +228,7 @@ def json(
     headers: Optional[Dict[str, str]] = None,
     content_type: str = "application/json",
     dumps: Optional[Callable[..., str]] = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> HTTPResponse:
     """
     Returns response object with body in json format.
@@ -362,27 +320,101 @@ def html(
     )
 
 
+async def validate_file(
+    request_headers: Header, last_modified: Union[datetime, float, int]
+):
+    try:
+        if_modified_since = request_headers.getone("If-Modified-Since")
+    except KeyError:
+        return
+    try:
+        if_modified_since = parsedate_to_datetime(if_modified_since)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignorning invalid If-Modified-Since header received: " "'%s'",
+            if_modified_since,
+        )
+        return
+    if not isinstance(last_modified, datetime):
+        last_modified = datetime.fromtimestamp(
+            float(last_modified), tz=timezone.utc
+        ).replace(microsecond=0)
+    if last_modified <= if_modified_since:
+        return HTTPResponse(status=304)
+
+
 async def file(
     location: Union[str, PurePath],
     status: int = 200,
+    request_headers: Optional[Header] = None,
+    validate_when_requested: bool = True,
     mime_type: Optional[str] = None,
     headers: Optional[Dict[str, str]] = None,
     filename: Optional[str] = None,
+    last_modified: Optional[Union[datetime, float, int, Default]] = _default,
+    max_age: Optional[Union[float, int]] = None,
+    no_store: Optional[bool] = None,
     _range: Optional[Range] = None,
 ) -> HTTPResponse:
     """Return a response object with file data.
-
+    :param status: HTTP response code. Won't enforce the passed in
+        status if only a part of the content will be sent (206)
+        or file is being validated (304).
+    :param request_headers: The request headers.
+    :param validate_when_requested: If True, will validate the
+        file when requested.
     :param location: Location of file on system.
     :param mime_type: Specific mime_type.
     :param headers: Custom Headers.
     :param filename: Override filename.
+    :param last_modified: The last modified date and time of the file.
+    :param max_age: Max age for cache control.
+    :param no_store: Any cache should not store this response.
     :param _range:
     """
+
+    if isinstance(last_modified, datetime):
+        last_modified = last_modified.replace(microsecond=0).timestamp()
+    elif isinstance(last_modified, Default):
+        stat = await stat_async(location)
+        last_modified = stat.st_mtime
+
+    if (
+        validate_when_requested
+        and request_headers is not None
+        and last_modified
+    ):
+        response = await validate_file(request_headers, last_modified)
+        if response:
+            return response
+
     headers = headers or {}
+    if last_modified:
+        headers.setdefault(
+            "Last-Modified", formatdate(last_modified, usegmt=True)
+        )
+
     if filename:
         headers.setdefault(
             "Content-Disposition", f'attachment; filename="{filename}"'
         )
+
+    if no_store:
+        cache_control = "no-store"
+    elif max_age:
+        cache_control = f"public, max-age={max_age}"
+        headers.setdefault(
+            "expires",
+            formatdate(
+                time() + max_age,
+                usegmt=True,
+            ),
+        )
+    else:
+        cache_control = "no-cache"
+
+    headers.setdefault("cache-control", cache_control)
+
     filename = filename or path.split(location)[-1]
 
     async with await open_async(location, mode="rb") as f:
@@ -405,6 +437,108 @@ async def file(
     )
 
 
+def redirect(
+    to: str,
+    headers: Optional[Dict[str, str]] = None,
+    status: int = 302,
+    content_type: str = "text/html; charset=utf-8",
+) -> HTTPResponse:
+    """
+    Abort execution and cause a 302 redirect (by default) by setting a
+    Location header.
+
+    :param to: path or fully qualified URL to redirect to
+    :param headers: optional dict of headers to include in the new request
+    :param status: status code (int) of the new request, defaults to 302
+    :param content_type: the content type (string) of the response
+    """
+    headers = headers or {}
+
+    # URL Quote the URL before redirecting
+    safe_to = quote_plus(to, safe=":/%#?&=@[]!$&'()*+,;")
+
+    # According to RFC 7231, a relative URI is now permitted.
+    headers["Location"] = safe_to
+
+    return HTTPResponse(
+        status=status, headers=headers, content_type=content_type
+    )
+
+
+class ResponseStream:
+    """
+    ResponseStream is a compat layer to bridge the gap after the deprecation
+    of StreamingHTTPResponse. It will be removed when:
+    - file_stream is moved to new style streaming
+    - file and file_stream are combined into a single API
+    """
+
+    __slots__ = (
+        "_cookies",
+        "content_type",
+        "headers",
+        "request",
+        "response",
+        "status",
+        "streaming_fn",
+    )
+
+    def __init__(
+        self,
+        streaming_fn: Callable[
+            [Union[BaseHTTPResponse, ResponseStream]],
+            Coroutine[Any, Any, None],
+        ],
+        status: int = 200,
+        headers: Optional[Union[Header, Dict[str, str]]] = None,
+        content_type: Optional[str] = None,
+    ):
+        self.streaming_fn = streaming_fn
+        self.status = status
+        self.headers = headers or Header()
+        self.content_type = content_type
+        self.request: Optional[Request] = None
+        self._cookies: Optional[CookieJar] = None
+
+    async def write(self, message: str):
+        await self.response.send(message)
+
+    async def stream(self) -> HTTPResponse:
+        if not self.request:
+            raise ServerError("Attempted response to unknown request")
+        self.response = await self.request.respond(
+            headers=self.headers,
+            status=self.status,
+            content_type=self.content_type,
+        )
+        await self.streaming_fn(self)
+        return self.response
+
+    async def eof(self) -> None:
+        await self.response.eof()
+
+    @property
+    def cookies(self) -> CookieJar:
+        if self._cookies is None:
+            self._cookies = CookieJar(self.headers)
+        return self._cookies
+
+    @property
+    def processed_headers(self):
+        return self.response.processed_headers
+
+    @property
+    def body(self):
+        return self.response.body
+
+    def __call__(self, request: Request) -> ResponseStream:
+        self.request = request
+        return self
+
+    def __await__(self):
+        return self.stream().__await__()
+
+
 async def file_stream(
     location: Union[str, PurePath],
     status: int = 200,
@@ -413,7 +547,7 @@ async def file_stream(
     headers: Optional[Dict[str, str]] = None,
     filename: Optional[str] = None,
     _range: Optional[Range] = None,
-) -> StreamingHTTPResponse:
+) -> ResponseStream:
     """Return a streaming response object with file data.
 
     :param location: Location of file on system.
@@ -421,7 +555,6 @@ async def file_stream(
     :param mime_type: Specific mime_type.
     :param headers: Custom Headers.
     :param filename: Override filename.
-    :param chunked: Deprecated
     :param _range:
     """
     headers = headers or {}
@@ -457,72 +590,9 @@ async def file_stream(
                         break
                     await response.write(content)
 
-    return StreamingHTTPResponse(
+    return ResponseStream(
         streaming_fn=_streaming_fn,
         status=status,
         headers=headers,
         content_type=mime_type,
-        ignore_deprecation_notice=True,
-    )
-
-
-def stream(
-    streaming_fn: StreamingFunction,
-    status: int = 200,
-    headers: Optional[Dict[str, str]] = None,
-    content_type: str = "text/plain; charset=utf-8",
-):
-    """Accepts an coroutine `streaming_fn` which can be used to
-    write chunks to a streaming response. Returns a `StreamingHTTPResponse`.
-
-    Example usage::
-
-        @app.route("/")
-        async def index(request):
-            async def streaming_fn(response):
-                await response.write('foo')
-                await response.write('bar')
-
-            return stream(streaming_fn, content_type='text/plain')
-
-    :param streaming_fn: A coroutine accepts a response and
-        writes content to that response.
-    :param mime_type: Specific mime_type.
-    :param headers: Custom Headers.
-    :param chunked: Deprecated
-    """
-    return StreamingHTTPResponse(
-        streaming_fn,
-        headers=headers,
-        content_type=content_type,
-        status=status,
-        ignore_deprecation_notice=True,
-    )
-
-
-def redirect(
-    to: str,
-    headers: Optional[Dict[str, str]] = None,
-    status: int = 302,
-    content_type: str = "text/html; charset=utf-8",
-) -> HTTPResponse:
-    """
-    Abort execution and cause a 302 redirect (by default) by setting a
-    Location header.
-
-    :param to: path or fully qualified URL to redirect to
-    :param headers: optional dict of headers to include in the new request
-    :param status: status code (int) of the new request, defaults to 302
-    :param content_type: the content type (string) of the response
-    """
-    headers = headers or {}
-
-    # URL Quote the URL before redirecting
-    safe_to = quote_plus(to, safe=":/%#?&=@[]!$&'()*+,;")
-
-    # According to RFC 7231, a relative URI is now permitted.
-    headers["Location"] = safe_to
-
-    return HTTPResponse(
-        status=status, headers=headers, content_type=content_type
     )

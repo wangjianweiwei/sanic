@@ -1,40 +1,54 @@
 from ast import NodeVisitor, Return, parse
+from contextlib import suppress
 from functools import partial, wraps
 from inspect import getsource, signature
 from mimetypes import guess_type
 from os import path
-from pathlib import PurePath
-from re import sub
+from pathlib import Path, PurePath
 from textwrap import dedent
 from time import gmtime, strftime
-from typing import Any, Callable, Iterable, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 from urllib.parse import unquote
 
-from sanic_routing.route import Route  # type: ignore
+from sanic_routing.route import Route
 
+from sanic.base.meta import SanicMeta
 from sanic.compat import stat_async
 from sanic.constants import DEFAULT_HTTP_CONTENT_TYPE, HTTP_METHODS
 from sanic.errorpages import RESPONSE_MAPPING
-from sanic.exceptions import (
-    ContentRangeError,
-    FileNotFound,
-    HeaderNotFound,
-    InvalidUsage,
-)
+from sanic.exceptions import FileNotFound, HeaderNotFound, RangeNotSatisfiable
 from sanic.handlers import ContentRangeHandler
 from sanic.log import error_logger
 from sanic.models.futures import FutureRoute, FutureStatic
 from sanic.models.handler_types import RouteHandler
 from sanic.response import HTTPResponse, file, file_stream
-from sanic.views import CompositionView
+from sanic.types import HashableDict
 
 
 RouteWrapper = Callable[
     [RouteHandler], Union[RouteHandler, Tuple[Route, RouteHandler]]
 ]
+RESTRICTED_ROUTE_CONTEXT = (
+    "ignore_body",
+    "stream",
+    "hosts",
+    "static",
+    "error_format",
+    "websocket",
+)
 
 
-class RouteMixin:
+class RouteMixin(metaclass=SanicMeta):
     name: str
 
     def __init__(self, *args, **kwargs) -> None:
@@ -52,7 +66,7 @@ class RouteMixin:
         self,
         uri: str,
         methods: Optional[Iterable[str]] = None,
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
         stream: bool = False,
         version: Optional[Union[int, str, float]] = None,
@@ -65,9 +79,19 @@ class RouteMixin:
         static: bool = False,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
+        **ctx_kwargs: Any,
     ) -> RouteWrapper:
         """
         Decorate a function to be registered as a route
+
+
+        **Example using context kwargs**
+
+        .. code-block:: python
+
+            @app.route(..., ctx_foo="foobar")
+            async def route_handler(request: Request):
+                assert request.route.ctx.foo == "foobar"
 
         :param uri: path of the URL
         :param methods: list or tuple of methods allowed
@@ -80,6 +104,8 @@ class RouteMixin:
             body (eg. GET requests)
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: tuple of routes, decorated function
         """
 
@@ -93,6 +119,8 @@ class RouteMixin:
 
         if not methods and not websocket:
             methods = frozenset({"GET"})
+
+        route_context = self._build_route_context(ctx_kwargs)
 
         def decorator(handler):
             nonlocal uri
@@ -152,6 +180,7 @@ class RouteMixin:
                 static,
                 version_prefix,
                 error_format,
+                route_context,
             )
 
             self._future_routes.add(route)
@@ -189,13 +218,14 @@ class RouteMixin:
         handler: RouteHandler,
         uri: str,
         methods: Iterable[str] = frozenset({"GET"}),
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
-        version: Optional[int] = None,
+        version: Optional[Union[int, str, float]] = None,
         name: Optional[str] = None,
         stream: bool = False,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
+        **ctx_kwargs: Any,
     ) -> RouteHandler:
         """A helper method to register class instance or
         functions as a handler to the application url
@@ -212,6 +242,8 @@ class RouteMixin:
         :param stream: boolean specifying if the handler is a stream handler
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: function or class instance
         """
         # Handle HTTPMethodView differently
@@ -226,14 +258,6 @@ class RouteMixin:
                     if hasattr(_handler, "is_stream"):
                         stream = True
 
-        # handle composition view differently
-        if isinstance(handler, CompositionView):
-            methods = handler.handlers.keys()
-            for _handler in handler.handlers.values():
-                if hasattr(_handler, "is_stream"):
-                    stream = True
-                    break
-
         if strict_slashes is None:
             strict_slashes = self.strict_slashes
 
@@ -247,6 +271,7 @@ class RouteMixin:
             name=name,
             version_prefix=version_prefix,
             error_format=error_format,
+            **ctx_kwargs,
         )(handler)
         return handler
 
@@ -254,14 +279,15 @@ class RouteMixin:
     def get(
         self,
         uri: str,
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
-        version: Optional[int] = None,
+        version: Optional[Union[int, str, float]] = None,
         name: Optional[str] = None,
         ignore_body: bool = True,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
-    ) -> RouteWrapper:
+        **ctx_kwargs: Any,
+    ) -> RouteHandler:
         """
         Add an API URL under the **GET** *HTTP* method
 
@@ -273,31 +299,38 @@ class RouteMixin:
         :param name: Unique name that can be used to identify the Route
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: Object decorated with :func:`route` method
         """
-        return self.route(
-            uri,
-            methods=frozenset({"GET"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            version=version,
-            name=name,
-            ignore_body=ignore_body,
-            version_prefix=version_prefix,
-            error_format=error_format,
+        return cast(
+            RouteHandler,
+            self.route(
+                uri,
+                methods=frozenset({"GET"}),
+                host=host,
+                strict_slashes=strict_slashes,
+                version=version,
+                name=name,
+                ignore_body=ignore_body,
+                version_prefix=version_prefix,
+                error_format=error_format,
+                **ctx_kwargs,
+            ),
         )
 
     def post(
         self,
         uri: str,
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
         stream: bool = False,
-        version: Optional[int] = None,
+        version: Optional[Union[int, str, float]] = None,
         name: Optional[str] = None,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
-    ) -> RouteWrapper:
+        **ctx_kwargs: Any,
+    ) -> RouteHandler:
         """
         Add an API URL under the **POST** *HTTP* method
 
@@ -309,31 +342,38 @@ class RouteMixin:
         :param name: Unique name that can be used to identify the Route
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: Object decorated with :func:`route` method
         """
-        return self.route(
-            uri,
-            methods=frozenset({"POST"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            stream=stream,
-            version=version,
-            name=name,
-            version_prefix=version_prefix,
-            error_format=error_format,
+        return cast(
+            RouteHandler,
+            self.route(
+                uri,
+                methods=frozenset({"POST"}),
+                host=host,
+                strict_slashes=strict_slashes,
+                stream=stream,
+                version=version,
+                name=name,
+                version_prefix=version_prefix,
+                error_format=error_format,
+                **ctx_kwargs,
+            ),
         )
 
     def put(
         self,
         uri: str,
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
         stream: bool = False,
-        version: Optional[int] = None,
+        version: Optional[Union[int, str, float]] = None,
         name: Optional[str] = None,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
-    ) -> RouteWrapper:
+        **ctx_kwargs: Any,
+    ) -> RouteHandler:
         """
         Add an API URL under the **PUT** *HTTP* method
 
@@ -345,31 +385,38 @@ class RouteMixin:
         :param name: Unique name that can be used to identify the Route
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: Object decorated with :func:`route` method
         """
-        return self.route(
-            uri,
-            methods=frozenset({"PUT"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            stream=stream,
-            version=version,
-            name=name,
-            version_prefix=version_prefix,
-            error_format=error_format,
+        return cast(
+            RouteHandler,
+            self.route(
+                uri,
+                methods=frozenset({"PUT"}),
+                host=host,
+                strict_slashes=strict_slashes,
+                stream=stream,
+                version=version,
+                name=name,
+                version_prefix=version_prefix,
+                error_format=error_format,
+                **ctx_kwargs,
+            ),
         )
 
     def head(
         self,
         uri: str,
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
-        version: Optional[int] = None,
+        version: Optional[Union[int, str, float]] = None,
         name: Optional[str] = None,
         ignore_body: bool = True,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
-    ) -> RouteWrapper:
+        **ctx_kwargs: Any,
+    ) -> RouteHandler:
         """
         Add an API URL under the **HEAD** *HTTP* method
 
@@ -389,31 +436,38 @@ class RouteMixin:
         :type ignore_body: bool, optional
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: Object decorated with :func:`route` method
         """
-        return self.route(
-            uri,
-            methods=frozenset({"HEAD"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            version=version,
-            name=name,
-            ignore_body=ignore_body,
-            version_prefix=version_prefix,
-            error_format=error_format,
+        return cast(
+            RouteHandler,
+            self.route(
+                uri,
+                methods=frozenset({"HEAD"}),
+                host=host,
+                strict_slashes=strict_slashes,
+                version=version,
+                name=name,
+                ignore_body=ignore_body,
+                version_prefix=version_prefix,
+                error_format=error_format,
+                **ctx_kwargs,
+            ),
         )
 
     def options(
         self,
         uri: str,
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
-        version: Optional[int] = None,
+        version: Optional[Union[int, str, float]] = None,
         name: Optional[str] = None,
         ignore_body: bool = True,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
-    ) -> RouteWrapper:
+        **ctx_kwargs: Any,
+    ) -> RouteHandler:
         """
         Add an API URL under the **OPTIONS** *HTTP* method
 
@@ -433,31 +487,38 @@ class RouteMixin:
         :type ignore_body: bool, optional
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: Object decorated with :func:`route` method
         """
-        return self.route(
-            uri,
-            methods=frozenset({"OPTIONS"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            version=version,
-            name=name,
-            ignore_body=ignore_body,
-            version_prefix=version_prefix,
-            error_format=error_format,
+        return cast(
+            RouteHandler,
+            self.route(
+                uri,
+                methods=frozenset({"OPTIONS"}),
+                host=host,
+                strict_slashes=strict_slashes,
+                version=version,
+                name=name,
+                ignore_body=ignore_body,
+                version_prefix=version_prefix,
+                error_format=error_format,
+                **ctx_kwargs,
+            ),
         )
 
     def patch(
         self,
         uri: str,
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
         stream=False,
-        version: Optional[int] = None,
+        version: Optional[Union[int, str, float]] = None,
         name: Optional[str] = None,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
-    ) -> RouteWrapper:
+        **ctx_kwargs: Any,
+    ) -> RouteHandler:
         """
         Add an API URL under the **PATCH** *HTTP* method
 
@@ -479,31 +540,38 @@ class RouteMixin:
         :type ignore_body: bool, optional
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: Object decorated with :func:`route` method
         """
-        return self.route(
-            uri,
-            methods=frozenset({"PATCH"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            stream=stream,
-            version=version,
-            name=name,
-            version_prefix=version_prefix,
-            error_format=error_format,
+        return cast(
+            RouteHandler,
+            self.route(
+                uri,
+                methods=frozenset({"PATCH"}),
+                host=host,
+                strict_slashes=strict_slashes,
+                stream=stream,
+                version=version,
+                name=name,
+                version_prefix=version_prefix,
+                error_format=error_format,
+                **ctx_kwargs,
+            ),
         )
 
     def delete(
         self,
         uri: str,
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
-        version: Optional[int] = None,
+        version: Optional[Union[int, str, float]] = None,
         name: Optional[str] = None,
         ignore_body: bool = True,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
-    ) -> RouteWrapper:
+        **ctx_kwargs: Any,
+    ) -> RouteHandler:
         """
         Add an API URL under the **DELETE** *HTTP* method
 
@@ -515,31 +583,38 @@ class RouteMixin:
         :param name: Unique name that can be used to identify the Route
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: Object decorated with :func:`route` method
         """
-        return self.route(
-            uri,
-            methods=frozenset({"DELETE"}),
-            host=host,
-            strict_slashes=strict_slashes,
-            version=version,
-            name=name,
-            ignore_body=ignore_body,
-            version_prefix=version_prefix,
-            error_format=error_format,
+        return cast(
+            RouteHandler,
+            self.route(
+                uri,
+                methods=frozenset({"DELETE"}),
+                host=host,
+                strict_slashes=strict_slashes,
+                version=version,
+                name=name,
+                ignore_body=ignore_body,
+                version_prefix=version_prefix,
+                error_format=error_format,
+                **ctx_kwargs,
+            ),
         )
 
     def websocket(
         self,
         uri: str,
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
         subprotocols: Optional[List[str]] = None,
-        version: Optional[int] = None,
+        version: Optional[Union[int, str, float]] = None,
         name: Optional[str] = None,
         apply: bool = True,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
+        **ctx_kwargs: Any,
     ):
         """
         Decorate a function to be registered as a websocket route
@@ -553,6 +628,8 @@ class RouteMixin:
                      be used with :func:`url_for`
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: tuple of routes, decorated function
         """
         return self.route(
@@ -567,19 +644,21 @@ class RouteMixin:
             websocket=True,
             version_prefix=version_prefix,
             error_format=error_format,
+            **ctx_kwargs,
         )
 
     def add_websocket_route(
         self,
         handler,
         uri: str,
-        host: Optional[str] = None,
+        host: Optional[Union[str, List[str]]] = None,
         strict_slashes: Optional[bool] = None,
         subprotocols=None,
-        version: Optional[int] = None,
+        version: Optional[Union[int, str, float]] = None,
         name: Optional[str] = None,
         version_prefix: str = "/v",
         error_format: Optional[str] = None,
+        **ctx_kwargs: Any,
     ):
         """
         A helper method to register a function as a websocket route.
@@ -598,6 +677,8 @@ class RouteMixin:
                 be used with :func:`url_for`
         :param version_prefix: URL path that should be before the version
             value; default: ``/v``
+        :param  ctx_kwargs: Keyword arguments that begin with a ctx_* prefix
+            will be appended to the route context (``route.ctx``)
         :return: Objected decorated by :func:`websocket`
         """
         return self.websocket(
@@ -609,22 +690,23 @@ class RouteMixin:
             name=name,
             version_prefix=version_prefix,
             error_format=error_format,
+            **ctx_kwargs,
         )(handler)
 
     def static(
         self,
-        uri,
+        uri: str,
         file_or_directory: Union[str, bytes, PurePath],
-        pattern=r"/?.+",
-        use_modified_since=True,
-        use_content_range=False,
-        stream_large_files=False,
-        name="static",
-        host=None,
-        strict_slashes=None,
-        content_type=None,
-        apply=True,
-        resource_type=None,
+        pattern: str = r"/?.+",
+        use_modified_since: bool = True,
+        use_content_range: bool = False,
+        stream_large_files: bool = False,
+        name: str = "static",
+        host: Optional[str] = None,
+        strict_slashes: Optional[bool] = None,
+        content_type: Optional[bool] = None,
+        apply: bool = True,
+        resource_type: Optional[str] = None,
     ):
         """
         Register a root to serve files from. The input can either be a
@@ -718,32 +800,40 @@ class RouteMixin:
         content_type=None,
         __file_uri__=None,
     ):
-        # Using this to determine if the URL is trying to break out of the path
-        # served.  os.path.realpath seems to be very slow
-        if __file_uri__ and "../" in __file_uri__:
-            raise InvalidUsage("Invalid URL")
         # Merge served directory and requested file if provided
-        # Strip all / that in the beginning of the URL to help prevent python
-        # from herping a derp and treating the uri as an absolute path
-        root_path = file_path = file_or_directory
-        if __file_uri__:
-            file_path = path.join(
-                file_or_directory, sub("^[/]*", "", __file_uri__)
-            )
+        file_path_raw = Path(unquote(file_or_directory))
+        root_path = file_path = file_path_raw.resolve()
+        not_found = FileNotFound(
+            "File not found",
+            path=file_or_directory,
+            relative_url=__file_uri__,
+        )
 
-        # URL decode the path sent by the browser otherwise we won't be able to
-        # match filenames which got encoded (filenames with spaces etc)
-        file_path = path.abspath(unquote(file_path))
-        if not file_path.startswith(path.abspath(unquote(root_path))):
-            error_logger.exception(
-                f"File not found: path={file_or_directory}, "
-                f"relative_url={__file_uri__}"
-            )
-            raise FileNotFound(
-                "File not found",
-                path=file_or_directory,
-                relative_url=__file_uri__,
-            )
+        if __file_uri__:
+            # Strip all / that in the beginning of the URL to help prevent
+            # python from herping a derp and treating the uri as an
+            # absolute path
+            unquoted_file_uri = unquote(__file_uri__).lstrip("/")
+            file_path_raw = Path(file_or_directory, unquoted_file_uri)
+            file_path = file_path_raw.resolve()
+            if (
+                file_path < root_path and not file_path_raw.is_symlink()
+            ) or ".." in file_path_raw.parts:
+                error_logger.exception(
+                    f"File not found: path={file_or_directory}, "
+                    f"relative_url={__file_uri__}"
+                )
+                raise not_found
+
+        try:
+            file_path.relative_to(root_path)
+        except ValueError:
+            if not file_path_raw.is_symlink():
+                error_logger.exception(
+                    f"File not found: path={file_or_directory}, "
+                    f"relative_url={__file_uri__}"
+                )
+                raise not_found
         try:
             headers = {}
             # Check if the client has been sent this file before
@@ -808,14 +898,10 @@ class RouteMixin:
                             file_path, headers=headers, _range=_range
                         )
                 return await file(file_path, headers=headers, _range=_range)
-        except ContentRangeError:
+        except RangeNotSatisfiable:
             raise
         except FileNotFoundError:
-            raise FileNotFound(
-                "File not found",
-                path=file_or_directory,
-                relative_url=__file_uri__,
-            )
+            raise not_found
         except Exception:
             error_logger.exception(
                 f"Exception in static request handler: "
@@ -919,18 +1005,15 @@ class RouteMixin:
         return route
 
     def _determine_error_format(self, handler) -> str:
-        if not isinstance(handler, CompositionView):
-            try:
-                src = dedent(getsource(handler))
-                tree = parse(src)
-                http_response_types = self._get_response_types(tree)
+        with suppress(OSError, TypeError):
+            src = dedent(getsource(handler))
+            tree = parse(src)
+            http_response_types = self._get_response_types(tree)
 
-                if len(http_response_types) == 1:
-                    return next(iter(http_response_types))
-            except (OSError, TypeError):
-                ...
+            if len(http_response_types) == 1:
+                return next(iter(http_response_types))
 
-        return "auto"
+        return ""
 
     def _get_response_types(self, node):
         types = set()
@@ -939,7 +1022,7 @@ class RouteMixin:
             def visit_Return(self, node: Return) -> Any:
                 nonlocal types
 
-                try:
+                with suppress(AttributeError):
                     checks = [node.value.func.id]  # type: ignore
                     if node.value.keywords:  # type: ignore
                         checks += [
@@ -951,9 +1034,32 @@ class RouteMixin:
                     for check in checks:
                         if check in RESPONSE_MAPPING:
                             types.add(RESPONSE_MAPPING[check])
-                except AttributeError:
-                    ...
 
         HttpResponseVisitor().visit(node)
 
         return types
+
+    def _build_route_context(self, raw):
+        ctx_kwargs = {
+            key.replace("ctx_", ""): raw.pop(key)
+            for key in {**raw}.keys()
+            if key.startswith("ctx_")
+        }
+        restricted = [
+            key for key in ctx_kwargs.keys() if key in RESTRICTED_ROUTE_CONTEXT
+        ]
+        if restricted:
+            restricted_arguments = ", ".join(restricted)
+            raise AttributeError(
+                "Cannot use restricted route context: "
+                f"{restricted_arguments}. This limitation is only in place "
+                "until v22.9 when the restricted names will no longer be in"
+                "conflict. See https://github.com/sanic-org/sanic/issues/2303 "
+                "for more information."
+            )
+        if raw:
+            unexpected_arguments = ", ".join(raw.keys())
+            raise TypeError(
+                f"Unexpected keyword arguments: {unexpected_arguments}"
+            )
+        return HashableDict(ctx_kwargs)

@@ -3,7 +3,8 @@ import sys
 
 from typing import Any, Awaitable, Callable, MutableMapping, Optional, Union
 
-from sanic.exceptions import InvalidUsage
+from sanic.exceptions import BadRequest
+from sanic.models.protocol_types import TransportProtocol
 from sanic.server.websockets.connection import WebSocketConnection
 
 
@@ -13,7 +14,7 @@ ASGISend = Callable[[ASGIMessage], Awaitable[None]]
 ASGIReceive = Callable[[], Awaitable[ASGIMessage]]
 
 
-class MockProtocol:
+class MockProtocol:  # no cov
     def __init__(self, transport: "MockTransport", loop):
         # This should be refactored when < 3.8 support is dropped
         self.transport = transport
@@ -56,7 +57,7 @@ class MockProtocol:
         await self._not_paused.wait()
 
 
-class MockTransport:
+class MockTransport(TransportProtocol):  # no cov
     _protocol: Optional[MockProtocol]
 
     def __init__(
@@ -68,23 +69,25 @@ class MockTransport:
         self._protocol = None
         self.loop = None
 
-    def get_protocol(self) -> MockProtocol:
+    def get_protocol(self) -> MockProtocol:  # type: ignore
         if not self._protocol:
             self._protocol = MockProtocol(self, self.loop)
         return self._protocol
 
-    def get_extra_info(self, info: str) -> Union[str, bool, None]:
+    def get_extra_info(
+        self, info: str, default=None
+    ) -> Optional[Union[str, bool]]:
         if info == "peername":
             return self.scope.get("client")
         elif info == "sslcontext":
             return self.scope.get("scheme") in ["https", "wss"]
-        return None
+        return default
 
     def get_websocket_connection(self) -> WebSocketConnection:
         try:
             return self._websocket_connection
         except AttributeError:
-            raise InvalidUsage("Improper websocket connection.")
+            raise BadRequest("Improper websocket connection.")
 
     def create_websocket_connection(
         self, send: ASGISend, receive: ASGIReceive

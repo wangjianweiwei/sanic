@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import os
 import ssl
 
-from typing import Iterable, Optional, Union
+from typing import Any, Dict, Iterable, Optional, Union
 
 from sanic.log import logger
 
@@ -77,8 +79,79 @@ def load_cert_dir(p: str) -> ssl.SSLContext:
     return CertSimple(certfile, keyfile)
 
 
-class CertSimple(ssl.SSLContext):
+def find_cert(self: CertSelector, server_name: str):
+    """Find the first certificate that matches the given SNI.
+
+    :raises ssl.CertificateError: No matching certificate found.
+    :return: A matching ssl.SSLContext object if found."""
+    if not server_name:
+        if self.sanic_fallback:
+            return self.sanic_fallback
+        raise ValueError(
+            "The client provided no SNI to match for certificate."
+        )
+    for ctx in self.sanic_select:
+        if match_hostname(ctx, server_name):
+            return ctx
+    if self.sanic_fallback:
+        return self.sanic_fallback
+    raise ValueError(f"No certificate found matching hostname {server_name!r}")
+
+
+def match_hostname(
+    ctx: Union[ssl.SSLContext, CertSelector], hostname: str
+) -> bool:
+    """Match names from CertSelector against a received hostname."""
+    # Local certs are considered trusted, so this can be less pedantic
+    # and thus faster than the deprecated ssl.match_hostname function is.
+    names = dict(getattr(ctx, "sanic", {})).get("names", [])
+    hostname = hostname.lower()
+    for name in names:
+        if name.startswith("*."):
+            if hostname.split(".", 1)[-1] == name[2:]:
+                return True
+        elif name == hostname:
+            return True
+    return False
+
+
+def selector_sni_callback(
+    sslobj: ssl.SSLObject, server_name: str, ctx: CertSelector
+) -> Optional[int]:
+    """Select a certificate matching the SNI."""
+    # Call server_name_callback to store the SNI on sslobj
+    server_name_callback(sslobj, server_name, ctx)
+    # Find a new context matching the hostname
+    try:
+        sslobj.context = find_cert(ctx, server_name)
+    except ValueError as e:
+        logger.warning(f"Rejecting TLS connection: {e}")
+        # This would show ERR_SSL_UNRECOGNIZED_NAME_ALERT on client side if
+        # asyncio/uvloop did proper SSL shutdown. They don't.
+        return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+    return None  # mypy complains without explicit return
+
+
+def server_name_callback(
+    sslobj: ssl.SSLObject, server_name: str, ctx: ssl.SSLContext
+) -> None:
+    """Store the received SNI as sslobj.sanic_server_name."""
+    sslobj.sanic_server_name = server_name  # type: ignore
+
+
+class SanicSSLContext(ssl.SSLContext):
+    sanic: Dict[str, os.PathLike]
+
+    @classmethod
+    def create_from_ssl_context(cls, context: ssl.SSLContext):
+        context.__class__ = cls
+        return context
+
+
+class CertSimple(SanicSSLContext):
     """A wrapper for creating SSLContext with a sanic attribute."""
+
+    sanic: Dict[str, Any]
 
     def __new__(cls, cert, key, **kw):
         # try common aliases, rename to cert/key
@@ -124,7 +197,7 @@ class CertSelector(ssl.SSLContext):
         for i, ctx in enumerate(ctxs):
             if not ctx:
                 continue
-            names = getattr(ctx, "sanic", {}).get("names", [])
+            names = dict(getattr(ctx, "sanic", {})).get("names", [])
             all_names += names
             self.sanic_select.append(ctx)
             if i == 0:
@@ -134,63 +207,3 @@ class CertSelector(ssl.SSLContext):
                 "No certificates with SubjectAlternativeNames found."
             )
         logger.info(f"Certificate vhosts: {', '.join(all_names)}")
-
-
-def find_cert(self: CertSelector, server_name: str):
-    """Find the first certificate that matches the given SNI.
-
-    :raises ssl.CertificateError: No matching certificate found.
-    :return: A matching ssl.SSLContext object if found."""
-    if not server_name:
-        if self.sanic_fallback:
-            return self.sanic_fallback
-        raise ValueError(
-            "The client provided no SNI to match for certificate."
-        )
-    for ctx in self.sanic_select:
-        if match_hostname(ctx, server_name):
-            return ctx
-    if self.sanic_fallback:
-        return self.sanic_fallback
-    raise ValueError(f"No certificate found matching hostname {server_name!r}")
-
-
-def match_hostname(
-    ctx: Union[ssl.SSLContext, CertSelector], hostname: str
-) -> bool:
-    """Match names from CertSelector against a received hostname."""
-    # Local certs are considered trusted, so this can be less pedantic
-    # and thus faster than the deprecated ssl.match_hostname function is.
-    names = getattr(ctx, "sanic", {}).get("names", [])
-    hostname = hostname.lower()
-    for name in names:
-        if name.startswith("*."):
-            if hostname.split(".", 1)[-1] == name[2:]:
-                return True
-        elif name == hostname:
-            return True
-    return False
-
-
-def selector_sni_callback(
-    sslobj: ssl.SSLObject, server_name: str, ctx: CertSelector
-) -> Optional[int]:
-    """Select a certificate mathing the SNI."""
-    # Call server_name_callback to store the SNI on sslobj
-    server_name_callback(sslobj, server_name, ctx)
-    # Find a new context matching the hostname
-    try:
-        sslobj.context = find_cert(ctx, server_name)
-    except ValueError as e:
-        logger.warning(f"Rejecting TLS connection: {e}")
-        # This would show ERR_SSL_UNRECOGNIZED_NAME_ALERT on client side if
-        # asyncio/uvloop did proper SSL shutdown. They don't.
-        return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
-    return None  # mypy complains without explicit return
-
-
-def server_name_callback(
-    sslobj: ssl.SSLObject, server_name: str, ctx: ssl.SSLContext
-) -> None:
-    """Store the received SNI as sslobj.sanic_server_name."""
-    sslobj.sanic_server_name = server_name  # type: ignore

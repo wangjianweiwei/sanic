@@ -1,41 +1,51 @@
+from __future__ import annotations
+
 import warnings
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote
-
-import sanic.app  # noqa
 
 from sanic.compat import Header
 from sanic.exceptions import ServerError
+from sanic.helpers import _default
+from sanic.http import Stage
+from sanic.log import logger
 from sanic.models.asgi import ASGIReceive, ASGIScope, ASGISend, MockTransport
 from sanic.request import Request
+from sanic.response import BaseHTTPResponse
 from sanic.server import ConnInfo
 from sanic.server.websockets.connection import WebSocketConnection
 
 
+if TYPE_CHECKING:
+    from sanic import Sanic
+
+
 class Lifespan:
-    def __init__(self, asgi_app: "ASGIApp") -> None:
+    def __init__(self, asgi_app: ASGIApp) -> None:
         self.asgi_app = asgi_app
 
         if (
             "server.init.before"
             in self.asgi_app.sanic_app.signal_router.name_index
         ):
-            warnings.warn(
+            logger.debug(
                 'You have set a listener for "before_server_start" '
                 "in ASGI mode. "
                 "It will be executed as early as possible, but not before "
-                "the ASGI server is started."
+                "the ASGI server is started.",
+                extra={"verbosity": 1},
             )
         if (
             "server.shutdown.after"
             in self.asgi_app.sanic_app.signal_router.name_index
         ):
-            warnings.warn(
+            logger.debug(
                 'You have set a listener for "after_server_stop" '
                 "in ASGI mode. "
                 "It will be executed as late as possible, but not after "
-                "the ASGI server is stopped."
+                "the ASGI server is stopped.",
+                extra={"verbosity": 1},
             )
 
     async def startup(self) -> None:
@@ -50,6 +60,13 @@ class Lifespan:
         await self.asgi_app.sanic_app._startup()
         await self.asgi_app.sanic_app._server_event("init", "before")
         await self.asgi_app.sanic_app._server_event("init", "after")
+
+        if self.asgi_app.sanic_app.config.USE_UVLOOP is not _default:
+            warnings.warn(
+                "You have set the USE_UVLOOP configuration option, but Sanic "
+                "cannot control the event loop when running in ASGI mode."
+                "This option will be ignored."
+            )
 
     async def shutdown(self) -> None:
         """
@@ -78,11 +95,13 @@ class Lifespan:
 
 
 class ASGIApp:
-    sanic_app: "sanic.app.Sanic"
+    sanic_app: Sanic
     request: Request
     transport: MockTransport
     lifespan: Lifespan
     ws: Optional[WebSocketConnection]
+    stage: Stage
+    response: Optional[BaseHTTPResponse]
 
     def __init__(self) -> None:
         self.ws = None
@@ -95,6 +114,8 @@ class ASGIApp:
         instance.sanic_app = sanic_app
         instance.transport = MockTransport(scope, receive, send)
         instance.transport.loop = sanic_app.loop
+        instance.stage = Stage.IDLE
+        instance.response = None
         setattr(instance.transport, "add_task", sanic_app.loop.create_task)
 
         headers = Header(
@@ -143,12 +164,21 @@ class ASGIApp:
             instance.request_body = True
             instance.request.conn_info = ConnInfo(instance.transport)
 
+            await sanic_app.dispatch(
+                "http.lifecycle.request",
+                inline=True,
+                context={"request": instance.request},
+                fail_not_found=False,
+            )
+
         return instance
 
     async def read(self) -> Optional[bytes]:
         """
         Read and stream the body in chunks from an incoming ASGI message.
         """
+        if self.stage is Stage.IDLE:
+            self.stage = Stage.REQUEST
         message = await self.transport.receive()
         body = message.get("body", b"")
         if not message.get("more_body", False):
@@ -163,11 +193,17 @@ class ASGIApp:
             if data:
                 yield data
 
-    def respond(self, response):
+    def respond(self, response: BaseHTTPResponse):
+        if self.stage is not Stage.HANDLER:
+            self.stage = Stage.FAILED
+            raise RuntimeError("Response already started")
+        if self.response is not None:
+            self.response.stream = None
         response.stream, self.response = self, response
         return response
 
     async def send(self, data, end_stream):
+        self.stage = Stage.IDLE if end_stream else Stage.RESPONSE
         if self.response:
             response, self.response = self.response, None
             await self.transport.send(
@@ -195,6 +231,7 @@ class ASGIApp:
         Handle the incoming request.
         """
         try:
+            self.stage = Stage.HANDLER
             await self.sanic_app.handle_request(self.request)
         except Exception as e:
             await self.sanic_app.handle_exception(self.request, e)

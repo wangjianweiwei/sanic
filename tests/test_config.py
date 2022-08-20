@@ -1,13 +1,20 @@
+import logging
+import os
+
 from contextlib import contextmanager
 from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from textwrap import dedent
+from unittest.mock import Mock, call
 
 import pytest
 
+from pytest import MonkeyPatch
+
 from sanic import Sanic
 from sanic.config import DEFAULT_CONFIG, Config
+from sanic.constants import LocalCertCreator
 from sanic.exceptions import PyFileError
 
 
@@ -31,21 +38,26 @@ class ConfigTest:
         return self.not_for_config
 
 
-def test_load_from_object(app):
+class UltimateAnswer:
+    def __init__(self, answer):
+        self.answer = int(answer)
+
+
+def test_load_from_object(app: Sanic):
     app.config.load(ConfigTest)
     assert "CONFIG_VALUE" in app.config
     assert app.config.CONFIG_VALUE == "should be used"
     assert "not_for_config" not in app.config
 
 
-def test_load_from_object_string(app):
-    app.config.load("test_config.ConfigTest")
+def test_load_from_object_string(app: Sanic):
+    app.config.load("tests.test_config.ConfigTest")
     assert "CONFIG_VALUE" in app.config
     assert app.config.CONFIG_VALUE == "should be used"
     assert "not_for_config" not in app.config
 
 
-def test_load_from_instance(app):
+def test_load_from_instance(app: Sanic):
     app.config.load(ConfigTest())
     assert "CONFIG_VALUE" in app.config
     assert app.config.CONFIG_VALUE == "should be used"
@@ -54,89 +66,93 @@ def test_load_from_instance(app):
     assert "another_not_for_config" not in app.config
 
 
-def test_load_from_object_string_exception(app):
+def test_load_from_object_string_exception(app: Sanic):
     with pytest.raises(ImportError):
         app.config.load("test_config.Config.test")
 
 
 def test_auto_env_prefix():
     environ["SANIC_TEST_ANSWER"] = "42"
-    app = Sanic(name=__name__)
+    app = Sanic(name="Test")
     assert app.config.TEST_ANSWER == 42
     del environ["SANIC_TEST_ANSWER"]
 
 
 def test_auto_bool_env_prefix():
     environ["SANIC_TEST_ANSWER"] = "True"
-    app = Sanic(name=__name__)
+    app = Sanic(name="Test")
     assert app.config.TEST_ANSWER is True
     del environ["SANIC_TEST_ANSWER"]
-
-
-def test_dont_load_env():
-    environ["SANIC_TEST_ANSWER"] = "42"
-    app = Sanic(name=__name__, load_env=False)
-    assert getattr(app.config, "TEST_ANSWER", None) is None
-    del environ["SANIC_TEST_ANSWER"]
-
-
-@pytest.mark.parametrize("load_env", [None, False, "", "MYAPP_"])
-def test_load_env_deprecation(load_env):
-    with pytest.warns(DeprecationWarning, match=r"21\.12"):
-        _ = Sanic(name=__name__, load_env=load_env)
-
-
-def test_load_env_prefix():
-    environ["MYAPP_TEST_ANSWER"] = "42"
-    app = Sanic(name=__name__, load_env="MYAPP_")
-    assert app.config.TEST_ANSWER == 42
-    del environ["MYAPP_TEST_ANSWER"]
 
 
 @pytest.mark.parametrize("env_prefix", [None, ""])
 def test_empty_load_env_prefix(env_prefix):
     environ["SANIC_TEST_ANSWER"] = "42"
-    app = Sanic(name=__name__, env_prefix=env_prefix)
+    app = Sanic(name="Test", env_prefix=env_prefix)
     assert getattr(app.config, "TEST_ANSWER", None) is None
     del environ["SANIC_TEST_ANSWER"]
 
 
-def test_load_env_prefix_float_values():
-    environ["MYAPP_TEST_ROI"] = "2.3"
-    app = Sanic(name=__name__, load_env="MYAPP_")
-    assert app.config.TEST_ROI == 2.3
-    del environ["MYAPP_TEST_ROI"]
-
-
-def test_load_env_prefix_string_value():
-    environ["MYAPP_TEST_TOKEN"] = "somerandomtesttoken"
-    app = Sanic(name=__name__, load_env="MYAPP_")
-    assert app.config.TEST_TOKEN == "somerandomtesttoken"
-    del environ["MYAPP_TEST_TOKEN"]
-
-
 def test_env_prefix():
     environ["MYAPP_TEST_ANSWER"] = "42"
-    app = Sanic(name=__name__, env_prefix="MYAPP_")
+    app = Sanic(name="Test", env_prefix="MYAPP_")
     assert app.config.TEST_ANSWER == 42
     del environ["MYAPP_TEST_ANSWER"]
 
 
 def test_env_prefix_float_values():
     environ["MYAPP_TEST_ROI"] = "2.3"
-    app = Sanic(name=__name__, env_prefix="MYAPP_")
+    app = Sanic(name="Test", env_prefix="MYAPP_")
     assert app.config.TEST_ROI == 2.3
     del environ["MYAPP_TEST_ROI"]
 
 
 def test_env_prefix_string_value():
     environ["MYAPP_TEST_TOKEN"] = "somerandomtesttoken"
-    app = Sanic(name=__name__, env_prefix="MYAPP_")
+    app = Sanic(name="Test", env_prefix="MYAPP_")
     assert app.config.TEST_TOKEN == "somerandomtesttoken"
     del environ["MYAPP_TEST_TOKEN"]
 
 
-def test_load_from_file(app):
+def test_env_w_custom_converter():
+    environ["SANIC_TEST_ANSWER"] = "42"
+
+    config = Config(converters=[UltimateAnswer])
+    app = Sanic(name="Test", config=config)
+    assert isinstance(app.config.TEST_ANSWER, UltimateAnswer)
+    assert app.config.TEST_ANSWER.answer == 42
+    del environ["SANIC_TEST_ANSWER"]
+
+
+def test_env_lowercase():
+    with pytest.warns(None) as record:
+        environ["SANIC_test_answer"] = "42"
+        app = Sanic(name="Test")
+        assert app.config.test_answer == 42
+    assert str(record[0].message) == (
+        "[DEPRECATION v22.9] Lowercase environment variables will not be "
+        "loaded into Sanic config beginning in v22.9."
+    )
+    del environ["SANIC_test_answer"]
+
+
+def test_add_converter_multiple_times(caplog):
+    def converter():
+        ...
+
+    message = (
+        "Configuration value converter 'converter' has already been registered"
+    )
+    config = Config()
+    config.register_type(converter)
+    with caplog.at_level(logging.WARNING):
+        config.register_type(converter)
+
+    assert ("sanic.error", logging.WARNING, message) in caplog.record_tuples
+    assert len(config._converters) == 5
+
+
+def test_load_from_file(app: Sanic):
     config = dedent(
         """
     VALUE = 'some value'
@@ -155,12 +171,12 @@ def test_load_from_file(app):
         assert "condition" not in app.config
 
 
-def test_load_from_missing_file(app):
+def test_load_from_missing_file(app: Sanic):
     with pytest.raises(IOError):
         app.config.load("non-existent file")
 
 
-def test_load_from_envvar(app):
+def test_load_from_envvar(app: Sanic):
     config = "VALUE = 'some value'"
     with temp_path() as config_path:
         config_path.write_text(config)
@@ -170,7 +186,7 @@ def test_load_from_envvar(app):
         assert app.config.VALUE == "some value"
 
 
-def test_load_from_missing_envvar(app):
+def test_load_from_missing_envvar(app: Sanic):
     with pytest.raises(IOError) as e:
         app.config.load("non-existent variable")
         assert str(e.value) == (
@@ -180,7 +196,7 @@ def test_load_from_missing_envvar(app):
         )
 
 
-def test_load_config_from_file_invalid_syntax(app):
+def test_load_config_from_file_invalid_syntax(app: Sanic):
     config = "VALUE = some value"
     with temp_path() as config_path:
         config_path.write_text(config)
@@ -189,7 +205,7 @@ def test_load_config_from_file_invalid_syntax(app):
             app.config.load(config_path)
 
 
-def test_overwrite_exisiting_config(app):
+def test_overwrite_exisiting_config(app: Sanic):
     app.config.DEFAULT = 1
 
     class Config:
@@ -199,7 +215,7 @@ def test_overwrite_exisiting_config(app):
     assert app.config.DEFAULT == 2
 
 
-def test_overwrite_exisiting_config_ignore_lowercase(app):
+def test_overwrite_exisiting_config_ignore_lowercase(app: Sanic):
     app.config.default = 1
 
     class Config:
@@ -209,7 +225,7 @@ def test_overwrite_exisiting_config_ignore_lowercase(app):
     assert app.config.default == 1
 
 
-def test_missing_config(app):
+def test_missing_config(app: Sanic):
     with pytest.raises(AttributeError, match="Config has no 'NON_EXISTENT'"):
         _ = app.config.NON_EXISTENT
 
@@ -277,7 +293,7 @@ def test_config_custom_defaults_with_env():
         del environ[key]
 
 
-def test_config_access_log_passing_in_run(app):
+def test_config_access_log_passing_in_run(app: Sanic):
     assert app.config.ACCESS_LOG is True
 
     @app.listener("after_server_start")
@@ -287,12 +303,15 @@ def test_config_access_log_passing_in_run(app):
     app.run(port=1340, access_log=False)
     assert app.config.ACCESS_LOG is False
 
+    app.router.reset()
+    app.signal_router.reset()
+
     app.run(port=1340, access_log=True)
     assert app.config.ACCESS_LOG is True
 
 
 @pytest.mark.asyncio
-async def test_config_access_log_passing_in_create_server(app):
+async def test_config_access_log_passing_in_create_server(app: Sanic):
     assert app.config.ACCESS_LOG is True
 
     @app.listener("after_server_start")
@@ -341,12 +360,89 @@ _test_setting_as_module = str(
     ],
     ids=["from_dict", "from_class", "from_file"],
 )
-def test_update(app, conf_object):
+def test_update(app: Sanic, conf_object):
     app.update_config(conf_object)
     assert app.config["TEST_SETTING_VALUE"] == 1
 
 
-def test_update_from_lowercase_key(app):
+def test_update_from_lowercase_key(app: Sanic):
     d = {"test_setting_value": 1}
     app.update_config(d)
     assert "test_setting_value" not in app.config
+
+
+def test_config_set_methods(app: Sanic, monkeypatch: MonkeyPatch):
+    post_set = Mock()
+    monkeypatch.setattr(Config, "_post_set", post_set)
+
+    app.config.FOO = 1
+    post_set.assert_called_once_with("FOO", 1)
+    post_set.reset_mock()
+
+    app.config["FOO"] = 2
+    post_set.assert_called_once_with("FOO", 2)
+    post_set.reset_mock()
+
+    app.config.update({"FOO": 3})
+    post_set.assert_called_once_with("FOO", 3)
+    post_set.reset_mock()
+
+    app.config.update([("FOO", 4)])
+    post_set.assert_called_once_with("FOO", 4)
+    post_set.reset_mock()
+
+    app.config.update(FOO=5)
+    post_set.assert_called_once_with("FOO", 5)
+    post_set.reset_mock()
+
+    app.config.update({"FOO": 6}, {"BAR": 7})
+    post_set.assert_has_calls(
+        calls=[
+            call("FOO", 6),
+            call("BAR", 7),
+        ]
+    )
+    post_set.reset_mock()
+
+    app.config.update({"FOO": 8}, BAR=9)
+    post_set.assert_has_calls(
+        calls=[
+            call("FOO", 8),
+            call("BAR", 9),
+        ],
+        any_order=True,
+    )
+    post_set.reset_mock()
+
+    app.config.update_config({"FOO": 10})
+    post_set.assert_called_once_with("FOO", 10)
+
+
+def test_negative_proxy_count(app: Sanic):
+    app.config.PROXIES_COUNT = -1
+
+    message = (
+        "PROXIES_COUNT cannot be negative. "
+        "https://sanic.readthedocs.io/en/latest/sanic/config.html"
+        "#proxy-configuration"
+    )
+    with pytest.raises(ValueError, match=message):
+        app.prepare()
+
+
+@pytest.mark.parametrize(
+    "passed,expected",
+    (
+        ("auto", LocalCertCreator.AUTO),
+        ("mkcert", LocalCertCreator.MKCERT),
+        ("trustme", LocalCertCreator.TRUSTME),
+        ("AUTO", LocalCertCreator.AUTO),
+        ("MKCERT", LocalCertCreator.MKCERT),
+        ("TRUSTME", LocalCertCreator.TRUSTME),
+    ),
+)
+def test_convert_local_cert_creator(passed, expected):
+    os.environ["SANIC_LOCAL_CERT_CREATOR"] = passed
+    app = Sanic("Test")
+    assert app.config.LOCAL_CERT_CREATOR is expected
+    del os.environ["SANIC_LOCAL_CERT_CREATOR"]

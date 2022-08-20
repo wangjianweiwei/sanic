@@ -17,6 +17,14 @@ sanic.handlers
     :show-inheritance:
 
 
+sanic.headers
+--------------
+
+.. automodule:: sanic.headers
+    :members:
+    :show-inheritance:
+
+
 sanic.request
 -------------
 
@@ -36,12 +44,5 @@ sanic.views
 -----------
 
 .. automodule:: sanic.views
-    :members:
-    :show-inheritance:
-
-sanic.websocket
----------------
-
-.. automodule:: sanic.websocket
     :members:
     :show-inheritance:
